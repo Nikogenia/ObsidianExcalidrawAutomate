@@ -24,24 +24,24 @@
     "test:template": "node --test tests/*.test.mjs"
   },
   "devDependencies": {
-    "@zsviczian/excalidraw": "0.18.137",
+    "@codemirror/commands": "6.8.1",
+    "@codemirror/language": "6.11.0",
+    "@codemirror/state": "6.5.0",
+    "@codemirror/view": "6.38.6",
+    "@excalidraw/mermaid-to-excalidraw": "2.2.2",
+    "@types/node": "^22.19.19",
+    "@types/react": "19.2.18",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
+    "@zsviczian/colormaster": "^1.2.2",
+    "@zsviczian/excalidraw": "0.18.137",
     "esbuild": "^0.28.2",
     "eslint": "^10.10.0",
     "globals": "^15.0.0",
     "obsidian": "^1.13.1",
     "prettier": "^3.0.0",
     "tsx": "^4.0.0",
-    "typescript": "^5.5.0",
-    "@types/react": "19.2.18",
-    "@excalidraw/mermaid-to-excalidraw": "2.2.2",
-    "@codemirror/language": "6.11.0",
-    "@codemirror/commands": "6.8.1",
-    "@codemirror/state": "6.5.0",
-    "@codemirror/view": "6.38.6",
-    "@zsviczian/colormaster": "^1.2.2",
-    "@types/node": "^22.19.19"
+    "typescript": "^5.5.0"
   },
   "keywords": [
     "obsidian",
@@ -51,5 +51,8 @@
   ],
   "author": "",
   "license": "MIT",
-  "private": true
+  "private": true,
+  "dependencies": {
+    "p5": "^2.3.4"
+  }
 }
