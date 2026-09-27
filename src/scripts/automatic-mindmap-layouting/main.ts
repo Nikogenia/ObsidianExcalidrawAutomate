@@ -12,6 +12,7 @@
  */
 
 import { showNotice } from "../../sharedUtils/notice";
+import { openMindmapWorkbench } from "./ui";
 
 /**
  * Runs the Automatic Mindmap Layouting script.
@@ -24,20 +25,7 @@ export async function runAutomaticMindmapLayouting(
   ea: ExcalidrawAutomate,
   _api: ExcalidrawAPI,
 ): Promise<void> {
-  const selected = ea.getViewSelectedElements();
-
-  if (selected.length === 0) {
-    showNotice("Please select at least one element.");
-    return;
-  }
-
-  // TODO: implement Automatic Mindmap Layouting
-  // Suggested structure:
-  // - Keep reusable logic in src/sharedUtils/
-  // - Keep script-local constants/types under this folder
-  // - Commit scene changes via await ea.addElementsToView(...)
-
-  showNotice("Done. Replace this with your real workflow.");
+  openMindmapWorkbench(ea);
 }
 
 /**
