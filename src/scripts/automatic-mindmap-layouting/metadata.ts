@@ -11,6 +11,7 @@ export interface MindmapPadding {
 
 export interface MindmapRuntimeState {
     borderId?: string;
+    duplicateRootIds: string[];
     padding: MindmapPadding;
     rootId?: string;
     rootShape: MindmapShape;
@@ -27,6 +28,7 @@ export const DEFAULT_PADDING: MindmapPadding = {
 
 export const DEFAULT_RUNTIME_STATE: MindmapRuntimeState = {
     padding: DEFAULT_PADDING,
+    duplicateRootIds: [],
     rootShape: "ellipse",
     connectionDistance: 50,
 };
@@ -104,23 +106,30 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
         padding: { ...DEFAULT_PADDING },
         rootShape: "ellipse",
         connectionDistance: 50,
+        duplicateRootIds: [],
     };
 
+    let firstRoot = true;
     for (const element of elements) {
         const customData = element.customData as Record<string, unknown> | undefined;
         if (!state.borderId && getCustomDataValue(customData, "isMindmapBorder") === true) {
             state.borderId = element.id;
             state.padding = readPadding(customData);
         }
-        if (!state.rootId && getCustomDataValue(customData, "isMindmapRoot") === true) {
-            state.rootId = element.id;
-            state.rootShape = normalizeShape(getCustomDataValue(customData, "mindmapShape"));
-            state.connectionDistance = clampInteger(
-                getCustomDataValue(customData, "mindmapConnectionDistance"),
-                1,
-                300,
-                50,
-            );
+        if (getCustomDataValue(customData, "isMindmapRoot") === true) {
+            if (firstRoot) {
+                state.rootId = element.id;
+                state.rootShape = normalizeShape(getCustomDataValue(customData, "mindmapShape"));
+                state.connectionDistance = clampInteger(
+                    getCustomDataValue(customData, "mindmapConnectionDistance"),
+                    1,
+                    300,
+                    50,
+                );
+                firstRoot = false;
+            } else {
+                state.duplicateRootIds.push(element.id);
+            }
         }
     }
 

@@ -1,7 +1,7 @@
 import {
     clearIndicators,
-    refreshBorderIndicator,
-    refreshRootIndicator,
+    refreshIndicators,
+    type NodeIndicator,
     type IndicatorState,
 } from "./indicators";
 import {
@@ -13,6 +13,7 @@ import {
 } from "./metadata";
 import { resolveAnchor, resolveLogicalSelection, type LogicalElement } from "./groups";
 import { showNotice } from "../../sharedUtils/notice";
+import { parseMindmap } from "./parser";
 
 type CustomDataPatch = Parameters<ExcalidrawAutomate["addAppendUpdateCustomData"]>[1];
 
@@ -124,23 +125,36 @@ async function refreshConfiguredIndicators(
     ea: ExcalidrawAutomate,
     indicators: IndicatorState,
     state: MindmapRuntimeState,
+    nodes: readonly NodeIndicator[] = [],
 ): Promise<void> {
     const scene = ea.getViewElements();
     const border = resolveAnchor(ea, scene.find((element) => element.id === state.borderId), scene);
     const root = resolveAnchor(ea, scene.find((element) => element.id === state.rootId), scene);
-    await refreshBorderIndicator(ea, indicators, border, state.padding);
-    await refreshRootIndicator(ea, indicators, root);
+    await refreshIndicators(ea, indicators, border, state.padding, root, nodes);
+}
+
+async function repairRootFlags(ea: ExcalidrawAutomate, state: MindmapRuntimeState): Promise<void> {
+    if (state.duplicateRootIds.length === 0 || !state.rootId) return;
+    const scene = ea.getViewElements();
+    const duplicates = scene.filter((element) => state.duplicateRootIds.includes(element.id));
+    const patches = duplicates.map((element) => ({ id: element.id, patch: { isMindmapRoot: undefined } }));
+    if (patches.length === 0) return;
+    await saveMetadata(ea, duplicates, patches);
+    showNotice("Multiple mindmap roots found; kept the first root and removed the other root flags.");
+    state.duplicateRootIds = [];
 }
 
 function createBorderModal(
     ea: ExcalidrawAutomate,
     state: MindmapRuntimeState,
     indicators: IndicatorState,
+    nodes: readonly NodeIndicator[],
     onSaved: () => Promise<void>,
 ): void {
     const modal = new ea.FloatingModal(ea.plugin.app);
     let previewTimer: ReturnType<typeof setTimeout> | undefined;
     modal.titleEl.textContent = "Border Settings";
+    modal.modalEl.style.transform = "translate(2em, 2em)";
     modal.onOpen = () => {
         const content = modal.contentEl;
         content.empty();
@@ -149,7 +163,11 @@ function createBorderModal(
         let candidate = resolveAnchor(ea, scene.find((element) => element.id === state.borderId), scene);
         const candidateText = addText(content, `Border element: ${logicalLabel(candidate)}`);
         const nextPadding: MindmapPadding = { ...state.padding };
-        const preview = async (): Promise<void> => refreshBorderIndicator(ea, indicators, candidate, nextPadding);
+        const preview = async (): Promise<void> => {
+            const currentScene = ea.getViewElements();
+            const root = resolveAnchor(ea, currentScene.find((element) => element.id === state.rootId), currentScene);
+            await refreshIndicators(ea, indicators, candidate, nextPadding, root, nodes);
+        };
         const schedulePreview = (): void => {
             if (previewTimer !== undefined) clearTimeout(previewTimer);
             previewTimer = setTimeout(() => void preview(), 120);
@@ -214,77 +232,118 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
     const scene = ea.getViewElements();
     const state = loadRuntimeState(scene);
     const indicators: IndicatorState = { ids: [] };
+    let parsedNodes: NodeIndicator[] = [];
     const modal = new ea.FloatingModal(ea.plugin.app);
     let closed = false;
+    let renderMain: () => void = () => undefined;
     modal.titleEl.textContent = "Automatic Mindmap Layouting";
     modal.onOpen = () => {
-        const content = modal.contentEl;
-        content.empty();
-        styleModalContent(content, modal.modalEl);
-        const data = addSection(content, "Mindmap Data");
-        const currentScene = ea.getViewElements();
-        const border = resolveAnchor(ea, currentScene.find((element) => element.id === state.borderId), currentScene);
-        addText(data, `Border: ${logicalLabel(border)}`);
-        const configureBorder = addButton(data, "Configure border");
-        configureBorder.addEventListener("click", () => createBorderModal(ea, state, indicators, async () => {
-            await refreshConfiguredIndicators(ea, indicators, state);
-        }));
-        const root = currentScene.find((element) => element.id === state.rootId);
-        const logicalRoot = resolveAnchor(ea, root, currentScene);
-        addText(data, `Root: ${logicalLabel(logicalRoot)}`);
-        const selectRoot = addButton(data, "Select root element/group");
-        selectRoot.addEventListener("click", () => {
-            const selectedRoot = resolveLogicalSelection(ea, ea.getViewSelectedElements(), ea.getViewElements());
-            if (!selectedRoot) {
-                showNotice("Root selection must contain one element or one complete group.");
-                return;
-            }
-            const shape = normalizeShape(selectedRoot.anchor.type);
-            void saveMetadata(ea, [selectedRoot.anchor], [{
-                id: selectedRoot.anchor.id,
-                patch: {
-                    isMindmapRoot: true,
-                    isMindmapNode: true,
-                    mindmapShape: shape,
-                    mindmapConnectionDistance: state.connectionDistance,
-                    mindmapChildren: [],
-                },
-            }]).then(() => {
-                state.rootId = selectedRoot.anchor.id;
-                state.rootShape = shape;
-                void refreshRootIndicator(ea, indicators, selectedRoot);
+        renderMain = () => {
+            const content = modal.contentEl;
+            content.empty();
+            styleModalContent(content, modal.modalEl);
+            const data = addSection(content, "Mindmap Data");
+            const currentScene = ea.getViewElements();
+            const border = resolveAnchor(ea, currentScene.find((element) => element.id === state.borderId), currentScene);
+            addText(data, `Border: ${logicalLabel(border)}`);
+            const configureBorder = addButton(data, "Configure border");
+            configureBorder.addEventListener("click", () => createBorderModal(ea, state, indicators, parsedNodes, async () => {
+                await refreshConfiguredIndicators(ea, indicators, state, parsedNodes);
+                renderMain();
+            }));
+            const logicalRoot = resolveAnchor(ea, currentScene.find((element) => element.id === state.rootId), currentScene);
+            addText(data, `Root: ${logicalLabel(logicalRoot)}`);
+            const selectRoot = addButton(data, "Select root element/group");
+            selectRoot.addEventListener("click", () => {
+                const selectedRoot = resolveLogicalSelection(ea, ea.getViewSelectedElements(), ea.getViewElements());
+                if (!selectedRoot) {
+                    showNotice("Root selection must contain one element or one complete group.");
+                    return;
+                }
+                const oldRoots = ea.getViewElements().filter((element) => (element.customData as Record<string, unknown> | undefined)?.isMindmapRoot === true);
+                const shape = normalizeShape(selectedRoot.anchor.type);
+                const elements = [...oldRoots, selectedRoot.anchor].filter((element, index, all) => all.findIndex((item) => item.id === element.id) === index);
+                void saveMetadata(ea, elements, [
+                    ...oldRoots.filter((element) => element.id !== selectedRoot.anchor.id).map((element) => ({ id: element.id, patch: { isMindmapRoot: undefined } })),
+                    { id: selectedRoot.anchor.id, patch: { isMindmapRoot: true, isMindmapNode: true, mindmapShape: shape, mindmapConnectionDistance: state.connectionDistance, mindmapChildren: [] } },
+                ]).then(() => {
+                    state.rootId = selectedRoot.anchor.id;
+                    state.rootShape = shape;
+                    parsedNodes = [];
+                    delete state.graph;
+                    return refreshConfiguredIndicators(ea, indicators, state).then(renderMain);
+                });
             });
-        });
-        addText(data, "Graph statistics: available after parsing");
-        addRangePair(data, "Connection distance", 1, 300, state.connectionDistance, (value) => {
-            state.connectionDistance = value;
-        });
-        const parse = addButton(data, "Parse Mindmap");
-        parse.disabled = !state.rootId;
-        parse.addEventListener("click", () => addText(data, "Parsing hook ready; graph parser is the next implementation slice."));
-        addButton(data, "Clear Mindmap").disabled = true;
-        addButton(data, "Clear All Metadata").disabled = true;
+            addRangePair(data, "Connection distance", 1, 300, state.connectionDistance, (value) => {
+                state.connectionDistance = value;
+                renderMain();
+            });
+            const parse = addButton(data, "Parse Mindmap");
+            parse.disabled = !logicalRoot;
+            parse.addEventListener("click", () => {
+                if (!logicalRoot) return;
+                const parsed = parseMindmap(ea, logicalRoot, state.connectionDistance);
+                state.graph = parsed.graph;
+                parsedNodes = parsed.nodes.slice(1).map((logical) => {
+                    const parent = parsed.nodes.find((candidate) => parsed.graph.getNode(logical.anchor.id)?.parentId === candidate.anchor.id);
+                    return parent ? { logical, parent } : { logical };
+                });
+                const sceneNodes = ea.getViewElements().filter((element) => (element.customData as Record<string, unknown> | undefined)?.isMindmapNode === true);
+                const parsedPatches = parsed.nodes.map((node) => {
+                    const graphNode = parsed.graph.getNode(node.anchor.id)!;
+                    const existingData = node.anchor.customData as Record<string, unknown> | undefined;
+                    return {
+                        id: node.anchor.id,
+                        patch: {
+                            isMindmapNode: true,
+                            mindmapParent: graphNode.parentId,
+                            mindmapChildren: graphNode.children,
+                            ...(existingData?.mindmapShape === undefined ? { mindmapShape: node.anchor.type === "ellipse" ? "ellipse" : "rectangle" } : {}),
+                        },
+                    };
+                });
+                const parsedIds = new Set(parsed.nodes.map((node) => node.anchor.id));
+                const stalePatches = sceneNodes
+                    .filter((element) => !parsedIds.has(element.id) && element.id !== state.rootId)
+                    .map((element) => ({ id: element.id, patch: { isMindmapNode: undefined, mindmapParent: undefined, mindmapChildren: undefined } }));
+                const elements = [...sceneNodes, ...parsed.nodes.map((node) => node.anchor)].filter((element, index, all) => all.findIndex((item) => item.id === element.id) === index);
+                void saveMetadata(ea, elements, [...stalePatches, ...parsedPatches]).then(() => refreshConfiguredIndicators(ea, indicators, state, parsedNodes)).then(renderMain);
+            });
+            addText(data, state.graph ? `Graph statistics: ${state.graph.getAllNodes().length} nodes, ${state.graph.getEdges().length} edges` : "Graph statistics: available after parsing");
+            const metadataActions = data.ownerDocument.createElement("div");
+            metadataActions.style.display = "grid";
+            metadataActions.style.gridTemplateColumns = "auto auto";
+            metadataActions.style.gap = "0.5em";
+            addButton(metadataActions, "Clear Mindmap").disabled = true;
+            addButton(metadataActions, "Clear All Metadata").disabled = true;
+            data.appendChild(metadataActions);
 
-        const algorithm = addSection(content, "Algorithm");
-        const algorithmSelect = content.ownerDocument.createElement("select");
-        const defaultOption = content.ownerDocument.createElement("option");
-        defaultOption.value = "default";
-        defaultOption.textContent = "Default";
-        algorithmSelect.appendChild(defaultOption);
-        algorithm.appendChild(algorithmSelect);
-        addRangePair(algorithm, "Steps per render", 1, 1000, 1, () => undefined);
-        addText(algorithm, "Algorithm-specific options: reserved");
+            const algorithm = addSection(content, "Algorithm");
+            const algorithmSelect = content.ownerDocument.createElement("select");
+            const defaultOption = content.ownerDocument.createElement("option");
+            defaultOption.value = "default";
+            defaultOption.textContent = "Default";
+            algorithmSelect.appendChild(defaultOption);
+            algorithm.appendChild(algorithmSelect);
+            addRangePair(algorithm, "Steps per render", 1, 1000, 1, () => undefined);
+            addText(algorithm, "Algorithm-specific options: reserved");
 
-        const control = addSection(content, "Control");
-        for (const label of ["Start", "Step", "Reset", "Rollback", "Clear Backups"]) {
-            const button = addButton(control, label);
-            button.disabled = true;
-        }
-        addText(control, "Current step / total steps: - / -");
-        addText(control, "Milliseconds per step: now - | min - | average - | max -");
-        addCredit(content);
-
-        void refreshConfiguredIndicators(ea, indicators, state);
+            const control = addSection(content, "Control");
+            const firstRow = content.ownerDocument.createElement("div");
+            const secondRow = content.ownerDocument.createElement("div");
+            firstRow.style.display = secondRow.style.display = "grid";
+            firstRow.style.gap = secondRow.style.gap = "0.5em";
+            firstRow.style.gridTemplateColumns = "auto auto auto";
+            secondRow.style.gridTemplateColumns = "auto auto";
+            for (const label of ["Start", "Step", "Reset"]) addButton(firstRow, label).disabled = true;
+            for (const label of ["Rollback", "Clear Backups"]) addButton(secondRow, label).disabled = true;
+            control.append(firstRow, secondRow);
+            addText(control, "Current step / total steps: - / -");
+            addText(control, "Milliseconds per step: now - | min - | average - | max -");
+            addCredit(content);
+            void refreshConfiguredIndicators(ea, indicators, state, parsedNodes);
+        };
+        void repairRootFlags(ea, state).then(renderMain);
     };
     modal.onClose = () => {
         if (closed) return;

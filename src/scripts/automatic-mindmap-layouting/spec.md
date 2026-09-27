@@ -472,5 +472,34 @@ internals shortcut.
 The current implementation includes import-safe metadata loading, group-aware
 logical selection, unsaved indicator/metadata transactions, startup indicator
 refresh, selection notices, debounced border previews, and compact modal
-styling with a clickable credit link. The parser, metadata clearing, layout
-algorithm runner, and backup/rollback API checkpoint remain subsequent slices.
+styling with a clickable credit link. The child Border Settings modal is
+translated by a small viewport-relative offset so it does not obscure the main
+workbench. Border, root, parsed-node, and parent-arrow indicators are rebuilt
+in one transaction; the border therefore remains visible for the full lifetime
+of the main modal, including while Border Settings is open. All temporary
+indicators continue to carry `isMindmapTemporary: true`; child border previews
+replace the complete current set, including parsed node arrows, and all are
+removed when the main modal closes.
+
+The startup loader keeps the first root flag in stable scene order. If more
+than one element is flagged as a root, the remaining root flags are removed in
+one unsaved metadata transaction and a warning notice is shown. Selecting a new
+root removes the previous root flags in the same transaction. The main modal
+is rendered from current runtime state after each configuration or parse
+change, so labels, graph counts, and indicator state do not remain stale.
+Metadata actions are displayed in one row; Start, Step, and Reset share a row,
+as do Rollback and Clear Backups.
+
+The first parser slice is implemented in the import-safe `parser.ts` module.
+It filters temporary and line elements, walks a queue with a read pointer,
+uses ellipse-aware boundary distance checks, resolves the nearest eligible
+canvas element in stable scene order, rejects queued and cyclic candidates,
+and adds `TreeNode` instances parent-first to a `TreeGraph`. Parsed nodes
+retain their actual bounds and normalized shape. Parsing persists parent and
+children metadata, infers a missing shape, clears stale mindmap relationships,
+and creates green node indicators with small arrows toward each parent. The
+graph and indicator state are discarded and rebuilt when a new root is chosen
+or parsing is run again.
+
+Metadata clearing, the layout algorithm runner, and the backup/rollback API
+checkpoint remain subsequent slices.
