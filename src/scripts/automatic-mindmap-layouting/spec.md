@@ -55,7 +55,11 @@ imported by automated tests.
 - Treat scene elements as immutable. For a persistent edit, call
   `ea.clear()`, copy the required elements with
   `ea.copyViewElementsToEAforEditing(...)`, modify the workbench copies, and
-  commit one transaction with `await ea.addElementsToView()`.
+  commit one transaction with `await ea.addElementsToView(false, false)`.
+- UI metadata changes and temporary indicator transactions must not save the
+  open drawing file. The only save-enabled transaction is the explicit save
+  immediately before creating a backup for a layout run. This keeps preview,
+  selection, and configuration work from unexpectedly writing the active file.
 - Merge metadata with `ea.addAppendUpdateCustomData(id, patch)` so plugin or
   user metadata is preserved.
 - Temporary indicators are scene elements only while the main modal is open.
@@ -63,6 +67,29 @@ imported by automated tests.
   deleted/cleaned up when the modal closes. Cleanup must also run on failure.
 - Use the current view's document/window for DOM work and register listeners,
   timers, and observers with `ea.registerCleanup`.
+
+### 3.1 Group handling
+
+EA represents a group as several individual elements. Group members share one
+or more `groupIds`; there is no single scene element containing the group's
+geometry. The script therefore treats a group as one logical node:
+
+1. Reject a selection when `ea.getMaximumGroups(selection)` contains more than
+  one maximum group. A selection containing one element or one complete group
+  is unambiguous.
+2. Resolve the full group with
+  `ea.getElementsInTheSameGroupWithElement(anchor, scene)` and calculate its
+  bounds with `ea.getBoundingBox(elements)`.
+3. Use `ea.getLargestElement(elements)` as the stable anchor. Persist only that
+  anchor ID in border/root metadata; resolve the current group members again
+  whenever an indicator or node representation is rendered.
+4. `ea.getCommonGroupForElements(selection)` may be used as an additional
+  common-group check, but the selection must still be validated against the
+  current scene because group membership can change after metadata is saved.
+
+The anchor represents the group's node geometry while the full member list is
+used for bounds and later movement. Group layout must move or update all group
+members together and must preserve their IDs and unrelated metadata.
 
 ## 4. Persistent Metadata Contract
 
@@ -142,6 +169,13 @@ not mutate the scene.
 - Update the border preview live while either slider or text field changes.
   **Save** writes the border flag and padding metadata in one persistent scene
   transaction. **Cancel** discards both element and padding changes.
+- Border Settings displays exactly one logical candidate: the current border
+  anchor or `Not configured`. **Use selected element/group** replaces it only
+  when the current selection resolves to one logical element/group. An
+  ambiguous selection shows a notice and leaves the candidate unchanged.
+- Selecting a valid new candidate refreshes the preview immediately. Padding
+  changes use a short debounce so rapid slider input does not start one EA scene
+  transaction per input event.
 - The preview is a red dashed rectangle at the padded border bounds. Negative
   padding expands the bounds and positive padding contracts them according to
   the named side. No-border startup is silent and has no preview.
@@ -151,6 +185,7 @@ not mutate the scene.
 - Show the configured root's type and ID. If absent, show **Select root
   element**.
 - Root selection uses the current canvas selection and must be unambiguous.
+- An ambiguous root selection shows a notice and does not mutate metadata.
 - For a selected group, inspect its largest/boundary-like element and choose
   the shape that best matches the group's dimensions. Persist the chosen
   normalized shape with the root metadata.
@@ -181,7 +216,7 @@ not mutate the scene.
 
 ### 5.3 Control
 
-Provide **Start**, **Step**, **Reset**, **Rollback**, and **Clear backups**.
+Provide **Start**, **Step**, **Reset**, **Rollback**, and **Clear Backups**.
 
 - **Start** runs the selected algorithm until completion or cancellation,
   rendering after the configured number of algorithm steps.
@@ -191,12 +226,16 @@ Provide **Start**, **Step**, **Reset**, **Rollback**, and **Clear backups**.
   it does not discard user configuration.
 - **Rollback** asks for confirmation in an Obsidian modal, loads the newest
   backup for the current file into the main file, then removes that backup.
-- **Clear backups** removes all backups for the current file. If the backup
+- **Clear Backups** removes all backups for the current file. If the backup
   folder is empty afterward, remove the folder as well.
 
 Show current-run metrics: current step / total steps, and milliseconds per
 step for now, minimum, average, and maximum. Disable controls when their
 preconditions are not met (for example, no parsed graph or no active run).
+
+The modal content uses the current view's document, a compact `0.9em` base
+font, flex column layout, consistent gaps and margins, and a smaller credit
+line. The repository link in the credit line is a clickable link.
 
 At the bottom, show exactly:
 
@@ -343,13 +382,18 @@ and green per-node indicators/arrows. They must carry `isMindmapTemporary: true`
 metadata.
 
 Indicator refreshes must replace/delete the previous temporary set in one
-coherent EA transaction. Closing the main modal deletes all temporary
+coherent unsaved EA transaction (`addElementsToView(false, false)`). The
+initial main-modal open refreshes configured border and root indicators before
+the user opens any child settings modal. Closing the main modal deletes all temporary
 elements, including indicators created by an open child modal. Closing or
 cancelling Border Settings restores the last committed preview state.
 
-Persistent metadata and layout changes are committed with
-`await ea.addElementsToView()`. A failed transaction must leave runtime state
-consistent and must not leave the EA workbench dirty.
+Persistent metadata changes from the UI use
+`await ea.addElementsToView(false, false)`. Before the first mutation of a
+layout run, the current drawing is explicitly saved as part of backup
+preparation; that is the sole save-enabled scene transaction. A failed
+transaction must leave runtime state consistent and must not leave the EA
+workbench dirty.
 
 ## 10. Backups and Rollback
 
@@ -422,3 +466,11 @@ internals shortcut.
   mutate immutable scene elements directly.
 - The spec's unresolved backup path/reload checkpoint is resolved before
   backup controls are implemented.
+
+## 14. First-slice implementation notes
+
+The current implementation includes import-safe metadata loading, group-aware
+logical selection, unsaved indicator/metadata transactions, startup indicator
+refresh, selection notices, debounced border previews, and compact modal
+styling with a clickable credit link. The parser, metadata clearing, layout
+algorithm runner, and backup/rollback API checkpoint remain subsequent slices.

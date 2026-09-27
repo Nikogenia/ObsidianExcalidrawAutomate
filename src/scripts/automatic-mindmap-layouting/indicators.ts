@@ -1,4 +1,5 @@
 import type { MindmapPadding } from "./metadata";
+import type { LogicalElement } from "./groups";
 
 export interface IndicatorState {
     ids: string[];
@@ -37,7 +38,7 @@ async function replaceIndicators(
         }
     }
     indicatorState.ids = create();
-    await ea.addElementsToView(false, true);
+    await ea.addElementsToView(false, false);
     ea.clear();
 }
 
@@ -52,12 +53,12 @@ async function replaceIndicators(
 export async function refreshBorderIndicator(
     ea: ExcalidrawAutomate,
     indicatorState: IndicatorState,
-    border: ExcalidrawElement | undefined,
+    border: LogicalElement | undefined,
     padding: MindmapPadding,
 ): Promise<void> {
     await replaceIndicators(ea, indicatorState, () => {
         if (!border) return [];
-        const bounds = paddedBounds(border, padding);
+        const bounds = paddedBounds(border.bounds, padding);
         ea.style.strokeColor = "#e03131";
         ea.style.strokeStyle = "dashed";
         ea.style.strokeWidth = 2;
@@ -79,7 +80,7 @@ export async function refreshBorderIndicator(
 export async function refreshRootIndicator(
     ea: ExcalidrawAutomate,
     indicatorState: IndicatorState,
-    root: ExcalidrawElement | undefined,
+    root: LogicalElement | undefined,
 ): Promise<void> {
     await replaceIndicators(ea, indicatorState, () => {
         if (!root) return [];
@@ -88,9 +89,9 @@ export async function refreshRootIndicator(
         ea.style.strokeWidth = 2;
         ea.style.fillStyle = "solid";
         ea.style.opacity = 100;
-        const id = root.type === "ellipse"
-            ? ea.addEllipse(root.x, root.y, root.width, root.height)
-            : ea.addRect(root.x, root.y, root.width, root.height);
+        const id = root.anchor.type === "ellipse"
+            ? ea.addEllipse(root.bounds.x, root.bounds.y, root.bounds.width, root.bounds.height)
+            : ea.addRect(root.bounds.x, root.bounds.y, root.bounds.width, root.bounds.height);
         ea.addAppendUpdateCustomData(id, { isMindmapTemporary: true });
         return [id];
     });

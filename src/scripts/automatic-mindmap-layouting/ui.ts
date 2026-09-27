@@ -11,16 +11,15 @@ import {
     type MindmapPadding,
     type MindmapRuntimeState,
 } from "./metadata";
+import { resolveAnchor, resolveLogicalSelection, type LogicalElement } from "./groups";
+import { showNotice } from "../../sharedUtils/notice";
 
 type CustomDataPatch = Parameters<ExcalidrawAutomate["addAppendUpdateCustomData"]>[1];
-
-const CREDIT =
-    "Nikolas Beyer | W-Seminar Informatik 2027 (Bodensee-Gymnasium Lindau) | " +
-    "BOGYLI/simulierte-wirklichkeit";
 
 function addText(parent: HTMLElement, text: string): HTMLParagraphElement {
     const element = parent.ownerDocument.createElement("p");
     element.textContent = text;
+    element.style.margin = "0";
     parent.appendChild(element);
     return element;
 }
@@ -38,6 +37,10 @@ function addSection(parent: HTMLElement, title: string): HTMLElement {
     const heading = parent.ownerDocument.createElement("h3");
     heading.textContent = title;
     section.appendChild(heading);
+    section.style.display = "flex";
+    section.style.flexDirection = "column";
+    section.style.gap = "0.45em";
+    section.style.margin = "0 0 0.8em";
     parent.appendChild(section);
     return section;
 }
@@ -51,6 +54,9 @@ function addRangePair(
     onChange: (value: number) => void,
 ): void {
     const row = parent.ownerDocument.createElement("label");
+    row.style.display = "flex";
+    row.style.alignItems = "center";
+    row.style.gap = "0.5em";
     row.textContent = label;
     const range = parent.ownerDocument.createElement("input");
     range.type = "range";
@@ -62,6 +68,8 @@ function addRangePair(
     number.min = String(minimum);
     number.max = String(maximum);
     number.value = String(initial);
+    range.style.flex = "1 1 auto";
+    number.style.width = "5em";
     const update = (source: HTMLInputElement): void => {
         const value = clampInteger(source.value, minimum, maximum, initial);
         range.value = String(value);
@@ -82,12 +90,46 @@ async function saveMetadata(
     ea.clear();
     ea.copyViewElementsToEAforEditing(elements);
     for (const { id, patch } of patches) ea.addAppendUpdateCustomData(id, patch);
-    await ea.addElementsToView(false, true);
+    await ea.addElementsToView(false, false);
     ea.clear();
 }
 
-function elementLabel(element: ExcalidrawElement | undefined): string {
-    return element ? `${element.type} (${element.id})` : "Not configured";
+function logicalLabel(element: LogicalElement | undefined): string {
+    return element ? `${element.anchor.type} (${element.anchor.id})` : "Not configured";
+}
+
+function styleModalContent(content: HTMLElement, modal: HTMLElement): void {
+    content.style.fontSize = "0.9em";
+    content.style.display = "flex";
+    content.style.flexDirection = "column";
+    content.style.gap = "0.6em";
+    modal.style.width = "min(28em, 80vw)";
+}
+
+function addCredit(parent: HTMLElement): void {
+    const credit = parent.ownerDocument.createElement("p");
+    credit.style.fontSize = "0.8em";
+    credit.style.margin = "0.8em 0 0";
+    credit.style.opacity = "0.75";
+    credit.append("Nikolas Beyer | W-Seminar Informatik 2027 (Bodensee-Gymnasium Lindau) | ");
+    const link = parent.ownerDocument.createElement("a");
+    link.href = "https://github.com/BOGYLI/simulierte-wirklichkeit/tree/nikolas/projects/nikolas";
+    link.textContent = "BOGYLI/simulierte-wirklichkeit";
+    link.target = "_blank";
+    credit.appendChild(link);
+    parent.appendChild(credit);
+}
+
+async function refreshConfiguredIndicators(
+    ea: ExcalidrawAutomate,
+    indicators: IndicatorState,
+    state: MindmapRuntimeState,
+): Promise<void> {
+    const scene = ea.getViewElements();
+    const border = resolveAnchor(ea, scene.find((element) => element.id === state.borderId), scene);
+    const root = resolveAnchor(ea, scene.find((element) => element.id === state.rootId), scene);
+    await refreshBorderIndicator(ea, indicators, border, state.padding);
+    await refreshRootIndicator(ea, indicators, root);
 }
 
 function createBorderModal(
@@ -97,28 +139,36 @@ function createBorderModal(
     onSaved: () => Promise<void>,
 ): void {
     const modal = new ea.FloatingModal(ea.plugin.app);
+    let previewTimer: ReturnType<typeof setTimeout> | undefined;
     modal.titleEl.textContent = "Border Settings";
     modal.onOpen = () => {
         const content = modal.contentEl;
         content.empty();
+        styleModalContent(content, modal.modalEl);
         const scene = ea.getViewElements();
-        let candidate = scene.find((element) => element.id === state.borderId);
-        addText(content, `Current candidate: ${elementLabel(candidate)}`);
-        const choose = addButton(content, "Use current selection");
-        choose.addEventListener("click", () => {
-            const selected = ea.getViewSelectedElements();
-            if (selected.length === 1) {
-                candidate = selected[0];
-                addText(content, `Candidate: ${elementLabel(candidate)}`);
-            }
-        });
-
+        let candidate = resolveAnchor(ea, scene.find((element) => element.id === state.borderId), scene);
+        const candidateText = addText(content, `Border element: ${logicalLabel(candidate)}`);
         const nextPadding: MindmapPadding = { ...state.padding };
         const preview = async (): Promise<void> => refreshBorderIndicator(ea, indicators, candidate, nextPadding);
+        const schedulePreview = (): void => {
+            if (previewTimer !== undefined) clearTimeout(previewTimer);
+            previewTimer = setTimeout(() => void preview(), 120);
+        };
+        const choose = addButton(content, "Use selected element/group");
+        choose.addEventListener("click", () => {
+            candidate = resolveLogicalSelection(ea, ea.getViewSelectedElements(), ea.getViewElements());
+            if (!candidate) {
+                showNotice("Border selection must contain one element or one complete group.");
+                return;
+            }
+            candidateText.textContent = `Border element: ${logicalLabel(candidate)}`;
+            schedulePreview();
+        });
+
         for (const side of ["top", "left", "bottom", "right"] as const) {
             addRangePair(content, side, -120, 120, nextPadding[side], (value) => {
                 nextPadding[side] = value;
-                void preview();
+                schedulePreview();
             });
         }
         const actions = content.ownerDocument.createElement("div");
@@ -127,18 +177,18 @@ function createBorderModal(
         save.addEventListener("click", () => {
             if (!candidate) return;
             const selectedCandidate = candidate;
-            const previous = scene.find((element) => element.id === state.borderId);
+            const currentScene = ea.getViewElements();
+            const previous = resolveAnchor(ea, currentScene.find((element) => element.id === state.borderId), currentScene);
             const paddingData = { ...nextPadding } as Record<string, number>;
-            void saveMetadata(ea, [selectedCandidate, ...(previous && previous.id !== selectedCandidate.id ? [previous] : [])], [
-                ...(previous && previous.id !== selectedCandidate.id
-                    ? [{ id: previous.id, patch: { isMindmapBorder: undefined, mindmapPadding: undefined } }]
+            void saveMetadata(ea, [selectedCandidate.anchor, ...(previous && previous.anchor.id !== selectedCandidate.anchor.id ? [previous.anchor] : [])], [
+                ...(previous && previous.anchor.id !== selectedCandidate.anchor.id
+                    ? [{ id: previous.anchor.id, patch: { isMindmapBorder: undefined, mindmapPadding: undefined } }]
                     : []),
-                { id: selectedCandidate.id, patch: { isMindmapBorder: true, mindmapPadding: paddingData } },
+                { id: selectedCandidate.anchor.id, patch: { isMindmapBorder: true, mindmapPadding: paddingData } },
             ]).then(() => {
-                state.borderId = selectedCandidate.id;
+                state.borderId = selectedCandidate.anchor.id;
                 state.padding = { ...nextPadding };
                 modal.close();
-                return onSaved();
             });
         });
         cancel.addEventListener("click", () => {
@@ -148,6 +198,7 @@ function createBorderModal(
         void preview();
     };
     modal.onClose = () => {
+        if (previewTimer !== undefined) clearTimeout(previewTimer);
         void onSaved();
     };
     modal.open();
@@ -169,23 +220,28 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
     modal.onOpen = () => {
         const content = modal.contentEl;
         content.empty();
+        styleModalContent(content, modal.modalEl);
         const data = addSection(content, "Mindmap Data");
-        const border = scene.find((element) => element.id === state.borderId);
-        addText(data, `Border: ${elementLabel(border)}`);
+        const currentScene = ea.getViewElements();
+        const border = resolveAnchor(ea, currentScene.find((element) => element.id === state.borderId), currentScene);
+        addText(data, `Border: ${logicalLabel(border)}`);
         const configureBorder = addButton(data, "Configure border");
         configureBorder.addEventListener("click", () => createBorderModal(ea, state, indicators, async () => {
-            await refreshBorderIndicator(ea, indicators, scene.find((element) => element.id === state.borderId), state.padding);
+            await refreshConfiguredIndicators(ea, indicators, state);
         }));
-        const root = scene.find((element) => element.id === state.rootId);
-        addText(data, `Root: ${elementLabel(root)}`);
-        const selectRoot = addButton(data, root ? "Select root element" : "Select root element");
+        const root = currentScene.find((element) => element.id === state.rootId);
+        const logicalRoot = resolveAnchor(ea, root, currentScene);
+        addText(data, `Root: ${logicalLabel(logicalRoot)}`);
+        const selectRoot = addButton(data, "Select root element/group");
         selectRoot.addEventListener("click", () => {
-            const selected = ea.getViewSelectedElements();
-            if (selected.length !== 1) return;
-            const selectedRoot = selected[0];
-            const shape = normalizeShape(selectedRoot.type);
-            void saveMetadata(ea, [selectedRoot], [{
-                id: selectedRoot.id,
+            const selectedRoot = resolveLogicalSelection(ea, ea.getViewSelectedElements(), ea.getViewElements());
+            if (!selectedRoot) {
+                showNotice("Root selection must contain one element or one complete group.");
+                return;
+            }
+            const shape = normalizeShape(selectedRoot.anchor.type);
+            void saveMetadata(ea, [selectedRoot.anchor], [{
+                id: selectedRoot.anchor.id,
                 patch: {
                     isMindmapRoot: true,
                     isMindmapNode: true,
@@ -194,7 +250,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                     mindmapChildren: [],
                 },
             }]).then(() => {
-                state.rootId = selectedRoot.id;
+                state.rootId = selectedRoot.anchor.id;
                 state.rootShape = shape;
                 void refreshRootIndicator(ea, indicators, selectedRoot);
             });
@@ -220,16 +276,15 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
         addText(algorithm, "Algorithm-specific options: reserved");
 
         const control = addSection(content, "Control");
-        for (const label of ["Start", "Step", "Reset", "Rollback", "Clear backups"]) {
+        for (const label of ["Start", "Step", "Reset", "Rollback", "Clear Backups"]) {
             const button = addButton(control, label);
             button.disabled = true;
         }
         addText(control, "Current step / total steps: - / -");
         addText(control, "Milliseconds per step: now - | min - | average - | max -");
-        addText(content, CREDIT);
+        addCredit(content);
 
-        void refreshBorderIndicator(ea, indicators, border, state.padding);
-        void refreshRootIndicator(ea, indicators, root);
+        void refreshConfiguredIndicators(ea, indicators, state);
     };
     modal.onClose = () => {
         if (closed) return;
