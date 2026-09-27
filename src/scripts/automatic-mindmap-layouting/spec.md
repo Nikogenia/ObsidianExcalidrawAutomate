@@ -240,6 +240,33 @@ instances; preserve actual element dimensions because mixed shapes are a core
 research requirement. Positions are `p5.Vector` centers as required by the
 core.
 
+### 7.1 Core interaction contract
+
+The core is a mutable graph model. The parser must add nodes in parent-first
+order:
+
+1. Create the graph with the root ID and the available width and height.
+2. Add the root node first.
+3. Add each child only after its parent has been added.
+
+`TreeGraph.addNode(node)` stores the node in `graph.nodes`. If `node.parentId`
+is set and the parent is already present, it also appends the child ID to the
+parent's `children` array. It does not resolve a parent added later, reject
+duplicate child IDs, or clone the node. Parser-created nodes should therefore
+start with an empty `children` array; the graph builds the parent-to-child
+links as nodes are added. `TreeGraph.getChildren`, `getParent`,
+`getNeighbors`, `getRoot`, `getAllNodes`, and `getEdges` read this same graph
+state. `getCenter()` returns a new `p5.Vector(width / 2, height / 2)`.
+
+Each `TreeNode` must contain an ID, a mutable `p5.Vector` center position, a
+shape, and an empty or already-established children array. `parentId` is
+omitted only for the root. `width` and `height` are optional in the type but
+must be supplied for parsed ellipse and rectangle elements so the evaluation
+and rendering code can account for their actual dimensions. The core accepts
+the shape strings `point`, `circle`, `rectangle`, and `ellipse`; the parser's
+normalized persistent values remain `rectangle` and `ellipse` for the first
+UI slice.
+
 The selected implementation must satisfy `LayoutAlgorithm`:
 
 ```ts
@@ -249,11 +276,44 @@ isCompleted(): boolean
 getGraph(): TreeGraph
 ```
 
-An algorithm adapter maps graph node positions back to the corresponding
-Excalidraw elements while preserving shape, dimensions, metadata, and IDs.
-`dt` and the meaning of total steps must be defined by the chosen algorithm;
-the UI's steps-per-render value is a rendering batch size, not a hidden change
-to algorithm semantics.
+The reference simulation uses the following interaction sequence:
+
+1. Create a fresh `TreeGraph` with the requested drawing dimensions.
+2. Create or select an algorithm instance and configure its public parameters.
+3. Optionally initialize a separate algorithm on the same graph to provide an
+  initial layout, then initialize the selected algorithm with that graph.
+4. Render from `algorithm.getGraph()`.
+5. For each render, call `algorithm.step(dt)` up to the configured batch size,
+  stopping early when `algorithm.isCompleted()` becomes true.
+6. Render the graph returned by `getGraph()` and update the UI metrics.
+
+`getGraph()` returns the algorithm's live graph, not a snapshot. Algorithm
+steps mutate the `TreeNode.pos` vectors in that graph, so the adapter reads
+positions after each step and maps them to the corresponding Excalidraw IDs.
+It must preserve element shape, dimensions, metadata, and IDs while applying
+only the position change.
+
+`step(dt)` returns `true` while the algorithm has not completed and `false`
+after the step that reaches completion, matching the current
+`LayoutAlgorithm` documentation. Callers should still check
+`isCompleted()` before starting another step. `dt` is supplied by the caller;
+the p5 example passes `p.deltaTime`, but our algorithms currently
+does not use it. An adapter must not invent time scaling, the parameter can be omitted.
+
+The UI's steps-per-render value is only an outer loop around `step(dt)`. It
+must not change the algorithm's iteration count or other algorithm semantics.
+For our algorithms, `iterations` is the completion limit and `currentIteration` is
+incremented once per `step` call; non-root nodes are moved while the root is
+left fixed, and positive `borderPadding` clamps positions to the graph bounds,
+in this use case it should be always set to `1` cause padding is already applied to the graph dimensions.
+
+Initialization and reset are not universally interchangeable. The current
+`Algorithm.initialize(graph)` assigns the graph but does not reset
+`currentIteration`. Reset behavior must therefore create a fresh algorithm
+instance or explicitly reset the concrete algorithm's run state before
+calling `initialize`. Do not assume that `initialize` resets parameters,
+positions, or progress unless the selected implementation documents that
+behavior.
 
 The default algorithm is intentionally a placeholder until the algorithm
 selection policy is reviewed. The implementation must not claim that one
