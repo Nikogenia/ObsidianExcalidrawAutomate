@@ -96,7 +96,7 @@ members together and must preserve their IDs and unrelated metadata.
 Metadata is stored on the relevant persistent element using merged
 `customData`. IDs are always Excalidraw element IDs.
 
-### Border element
+### Border Element
 
 ```ts
 {
@@ -157,60 +157,64 @@ not mutate the scene.
 
 #### Border
 
-- Show the current border element's type and ID, or `Not configured`.
-- Provide **Configure border**, opening a second floating modal titled
+- Show the current Border Element's type and ID, or `Not Configured`.
+- Provide **Configure Border**, opening a second floating modal titled
   **Border Settings**.
 - Border Settings shows the current candidate's type and ID and allows the
-  user to choose a new border element from the current canvas selection. A
+  user to choose a new Border Element from the current canvas selection. A
   selection must be unambiguous; otherwise the prior border remains unchanged.
-- Provide four numeric controls: top, left, bottom, and right padding. Each
+- Provide four numeric controls: Top, Left, Bottom, and Right Padding. Each
   control has a synchronized range slider and number field, constrained to
   `-120..120`.
 - Update the border preview live while either slider or text field changes.
   **Save** writes the border flag and padding metadata in one persistent scene
   transaction. **Cancel** discards both element and padding changes.
-- Border Settings displays exactly one logical candidate: the current border
-  anchor or `Not configured`. **Use selected element/group** replaces it only
+- Border Settings displays exactly one logical candidate: the current Border
+  anchor or `Not Configured`. **Use Selected Element/Group** replaces it only
   when the current selection resolves to one logical element/group. An
   ambiguous selection shows a notice and leaves the candidate unchanged.
 - Selecting a valid new candidate refreshes the preview immediately. Padding
   changes use a short debounce so rapid slider input does not start one EA scene
   transaction per input event.
-- The preview is a red dashed rectangle at the padded border bounds. Negative
+- The preview is a red dashed rectangle at the padded Border bounds. Negative
   padding expands the bounds and positive padding contracts them according to
-  the named side. No-border startup is silent and has no preview.
+  the named side. No-Border startup is silent and has no preview.
 
-#### Root and parser settings
+#### Root and Parser Settings
 
-- Show the configured root's type and ID. If absent, show **Select root
-  element**.
+- Show the configured Root Element's type and ID. If absent, show **Select Root
+  Element/Group**.
 - Root selection uses the current canvas selection and must be unambiguous.
-- An ambiguous root selection shows a notice and does not mutate metadata.
+- An ambiguous Root selection shows a notice and does not mutate metadata.
 - For a selected group, inspect its largest/boundary-like element and choose
   the shape that best matches the group's dimensions. Persist the chosen
-  normalized shape with the root metadata.
-- Selecting/saving a root immediately starts automatic parsing from that root.
-- Show a shape dropdown (`ellipse` / `rect`) and **Apply to selection**. The
+  normalized shape with the Root metadata.
+- Selecting or saving a Root immediately starts automatic parsing from that
+  Root.
+- Show a shape dropdown (`ellipse` / `rect`) and **Apply To Selection**. The
   action updates only selected elements already marked `isMindmapNode`, both in
   metadata and in their temporary indicators.
-- Show graph statistics only after parsing, using
+- Show Graph Statistics only after parsing, using
   `calculateGraphMetricsString(graph)`.
-- Provide a connection-distance input with slider and number field, constrained
-  to `1..300`, defaulting to `50`. Save it in root metadata and use it during
+- Provide a Connection Distance input with slider and number field, constrained
+  to `1..300`, defaulting to `50`. Save it in Root metadata and use it during
   line-endpoint matching.
 - Provide **Parse Mindmap** to discard the current parsed graph and parse again
-  from the configured root.
-- Provide **Clear Mindmap** to remove all mindmap metadata from the current scene
-  and discard the current parsed graph. This action does not remove the border
-  or root flags, but it does remove all node flags and parent/children metadata.
-  Ask for confirmation in an Obsidian modal before clearing.
-- Provide **Clear All Metadata** to remove all mindmap metadata from the current scene, including border and root flags. Ask for confirmation in an Obsidian modal before clearing.
+  from the configured Root.
+- Provide **Clear Mindmap** to remove all Mindmap Node metadata from the current
+  scene and discard the current parsed graph. This action does not remove the
+  Border or Root flags, but it does remove node flags and parent/children
+  metadata while preserving normalized shape metadata. Ask for confirmation in
+  an Obsidian modal before clearing.
+- Provide **Clear All Metadata** to remove all Mindmap metadata from the current
+  scene, including Border and Root flags. Ask for confirmation in an Obsidian
+  modal before clearing.
 
 ### 5.2 Algorithm
 
 - Provide an algorithm dropdown. The first implementation exposes **Default**;
   the adapter must be designed for the concrete core algorithms later.
-- Provide a steps-per-render input with slider and number field constrained to
+- Provide a **Steps Per Render** input with slider and number field constrained to
   `1..1000`, default `1`.
 - Reserve a clearly labeled options area for algorithm-specific controls.
 
@@ -244,13 +248,15 @@ At the bottom, show exactly:
 
 ## 6. Mindmap Parsing
 
-Parsing is breadth-first and uses a queue plus a read pointer. All customData
-except for `mindmapShape` shall be removed from all existing node elements before
-parsing to ensure a clean starting state. The root is
+Parsing is breadth-first and uses a queue plus a read pointer. Existing
+Mindmap metadata on node elements shall be cleared while unrelated `customData`
+and any existing `mindmapShape` are preserved, to ensure a clean starting state.
+The Root is
 inserted first; nodes are never removed from the queue. For each queued node:
 
 1. Inspect line/arrow elements whose start or end is within the configured
-   connection distance of the node boundary.
+  Connection Distance of the node boundary. The configured Border Element and
+  every member of its group are excluded from candidates.
 2. For ellipse nodes, use the ellipse boundary/intersection geometry rather
    than only an axis-aligned rectangle.
 3. Resolve the opposite line endpoint to the nearest eligible canvas element.
@@ -375,9 +381,10 @@ research test graphs.
 
 ## 9. Temporary Indicators and Scene Transactions
 
-Indicators use the same coordinates as the current scene and are clearly
-distinguishable from user content: red dashed padded border, blue dashed root,
-and green per-node indicators/arrows. They must carry `isMindmapTemporary: true` in
+Indicators use the same coordinates as the current scene, are moved to the
+topmost scene z-index after each refresh, and are clearly distinguishable from
+user content: red dashed padded Border, blue dashed Root, and green per-node
+indicators/arrows. They must carry `isMindmapTemporary: true` in
 `customData`. Their IDs are held in runtime state, not persisted in root/node
 metadata.
 
@@ -459,7 +466,8 @@ internals shortcut.
 - A stored border is loaded on startup; an absent border causes no notice.
 - A stored root is loaded on startup and shows its blue preview; selecting a
   root starts parsing through the documented orchestration hook, even if the
-  parser initially returns an empty graph.
+  parser initially returns an empty graph. Persisted node metadata is loaded
+  and shown with green node and parent-arrow indicators on startup.
 - Closing the primary modal removes every temporary element marked with
   `isMindmapTemporary`.
 - The UI is implemented through documented EA/Obsidian APIs and does not
@@ -472,9 +480,9 @@ internals shortcut.
 The current implementation includes import-safe metadata loading, group-aware
 logical selection, unsaved indicator/metadata transactions, startup indicator
 refresh, selection notices, debounced border previews, and compact modal
-styling with a clickable credit link. The child Border Settings modal is
-translated by a small viewport-relative offset so it does not obscure the main
-workbench. Border, root, parsed-node, and parent-arrow indicators are rebuilt
+styling with a clickable credit link. The Border Settings modal uses the
+documented default positioning; no CSS translation is applied. Border, Root,
+parsed-node, and parent-arrow indicators are rebuilt
 in one transaction; the border therefore remains visible for the full lifetime
 of the main modal, including while Border Settings is open. All temporary
 indicators continue to carry `isMindmapTemporary: true`; child border previews
@@ -491,7 +499,8 @@ Metadata actions are displayed in one row; Start, Step, and Reset share a row,
 as do Rollback and Clear Backups.
 
 The first parser slice is implemented in the import-safe `parser.ts` module.
-It filters temporary and line elements, walks a queue with a read pointer,
+It filters temporary and line elements, excludes the configured Border Element
+and every member of its group, walks a queue with a read pointer,
 uses ellipse-aware boundary distance checks, resolves the nearest eligible
 canvas element in stable scene order, rejects queued and cyclic candidates,
 and adds `TreeNode` instances parent-first to a `TreeGraph`. Parsed nodes
@@ -501,5 +510,7 @@ and creates green node indicators with small arrows toward each parent. The
 graph and indicator state are discarded and rebuilt when a new root is chosen
 or parsing is run again.
 
-Metadata clearing, the layout algorithm runner, and the backup/rollback API
-checkpoint remain subsequent slices.
+Confirmed Clear Mindmap and Clear All Metadata actions are implemented through
+unsaved metadata transactions and preserve unrelated custom data. The layout
+algorithm runner and the backup/rollback API checkpoint remain subsequent
+slices.

@@ -106,9 +106,14 @@ export function parseMindmap(
     ea: ExcalidrawAutomate,
     root: LogicalElement,
     connectionDistance: number,
+    border: LogicalElement,
 ): ParsedMindmap {
-    const scene = ea.getViewElements().filter((element) => customData(element).isMindmapTemporary !== true);
-    const graph = new TreeGraph("Mindmap", root.anchor.id, root.bounds.width, root.bounds.height);
+    const borderIds = new Set(border?.elements.map((element) => element.id));
+    const scene = ea.getViewElements().filter((element) => {
+        const data = customData(element);
+        return data.isMindmapTemporary !== true && data.isMindmapBorder !== true && !borderIds.has(element.id);
+    });
+    const graph = new TreeGraph("Mindmap", root.anchor.id, border.bounds.width, border.bounds.height);
     const queue: LogicalElement[] = [root];
     const nodes: LogicalElement[] = [root];
     const queued = new Set([root.anchor.id]);
@@ -135,5 +140,7 @@ export function parseMindmap(
         }
     }
 
+    console.log(`Parsed ${nodes.length} nodes from mindmap. Serialized graph:`);
+    console.log(graph.serialize());
     return { graph, nodes };
 }

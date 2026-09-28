@@ -11,7 +11,6 @@ export interface MindmapPadding {
 
 export interface MindmapRuntimeState {
     borderId?: string;
-    duplicateRootIds: string[];
     padding: MindmapPadding;
     rootId?: string;
     rootShape: MindmapShape;
@@ -20,15 +19,14 @@ export interface MindmapRuntimeState {
 }
 
 export const DEFAULT_PADDING: MindmapPadding = {
-    top: 0,
-    left: 0,
-    bottom: 0,
-    right: 0,
+    top: 90,
+    left: 100,
+    bottom: 110,
+    right: 100,
 };
 
 export const DEFAULT_RUNTIME_STATE: MindmapRuntimeState = {
     padding: DEFAULT_PADDING,
-    duplicateRootIds: [],
     rootShape: "ellipse",
     connectionDistance: 50,
 };
@@ -106,10 +104,8 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
         padding: { ...DEFAULT_PADDING },
         rootShape: "ellipse",
         connectionDistance: 50,
-        duplicateRootIds: [],
     };
 
-    let firstRoot = true;
     for (const element of elements) {
         const customData = element.customData as Record<string, unknown> | undefined;
         if (!state.borderId && getCustomDataValue(customData, "isMindmapBorder") === true) {
@@ -117,7 +113,7 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
             state.padding = readPadding(customData);
         }
         if (getCustomDataValue(customData, "isMindmapRoot") === true) {
-            if (firstRoot) {
+            if (!state.rootId) {
                 state.rootId = element.id;
                 state.rootShape = normalizeShape(getCustomDataValue(customData, "mindmapShape"));
                 state.connectionDistance = clampInteger(
@@ -126,9 +122,6 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
                     300,
                     50,
                 );
-                firstRoot = false;
-            } else {
-                state.duplicateRootIds.push(element.id);
             }
         }
     }
