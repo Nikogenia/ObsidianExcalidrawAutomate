@@ -13,14 +13,15 @@ import {
 } from "./metadata";
 import { resolveAnchor, resolveLogicalSelection, type LogicalElement } from "./groups";
 import { showNotice } from "../../sharedUtils/notice";
-import { parseMindmap } from "./parser";
+import { loadMindmapFromMetadata, parseMindmap } from "./parser";
 import { calculateGraphMetricsString } from "./core/graph/evaluation";
+import { clearMindmapBackups, createMindmapBackup, listMindmapBackups, rollbackLatestMindmapBackup } from "./backup";
 
 type CustomDataPatch = Parameters<ExcalidrawAutomate["addAppendUpdateCustomData"]>[1];
 
 function addText(parent: HTMLElement, text: string): HTMLParagraphElement {
     const element = parent.ownerDocument.createElement("p");
-    element.textContent = text;
+    element.innerHTML = text;
     element.style.margin = "0";
     parent.appendChild(element);
     return element;
@@ -32,6 +33,12 @@ function addButton(parent: HTMLElement, label: string): HTMLButtonElement {
     button.textContent = label;
     parent.appendChild(button);
     return button;
+}
+
+function addSpacer(parent: HTMLElement, height: string): void {
+    const spacer = parent.ownerDocument.createElement("div");
+    spacer.style.height = height;
+    parent.appendChild(spacer);
 }
 
 function addSection(parent: HTMLElement, title: string): HTMLElement {
@@ -54,12 +61,17 @@ function addRangePair(
     maximum: number,
     initial: number,
     onChange: (value: number) => void,
+    minLabelWidth?: string,
 ): void {
-    const row = parent.ownerDocument.createElement("label");
+    const row = parent.ownerDocument.createElement("div");
     row.style.display = "flex";
     row.style.alignItems = "center";
     row.style.gap = "0.5em";
-    row.textContent = label;
+    const labelEl = parent.ownerDocument.createElement("label");
+    labelEl.textContent = label;
+    if (minLabelWidth) {
+        labelEl.style.minWidth = minLabelWidth;
+    }
     const range = parent.ownerDocument.createElement("input");
     range.type = "range";
     range.min = String(minimum);
@@ -80,7 +92,7 @@ function addRangePair(
     };
     range.addEventListener("input", () => update(range));
     number.addEventListener("input", () => update(number));
-    row.append(range, number);
+    row.append(labelEl, range, number);
     parent.appendChild(row);
 }
 
@@ -106,6 +118,9 @@ function confirmAction(
         modal.contentEl.empty();
         addText(modal.contentEl, message);
         const actions = modal.contentEl.ownerDocument.createElement("div");
+        actions.style.display = "flex";
+        actions.style.justifyContent = "flex-end";
+        actions.style.gap = "0.5em";
         const confirm = addButton(actions, "Confirm");
         const cancel = addButton(actions, "Cancel");
         confirm.addEventListener("click", () => {
@@ -138,12 +153,12 @@ function logicalLabel(element: LogicalElement | undefined): string {
     return element ? `${element.anchor.type} (${element.anchor.id})` : "Not Configured";
 }
 
-function styleModalContent(content: HTMLElement, modal: HTMLElement): void {
+function styleModalContent(content: HTMLElement, modal: HTMLElement, width: string): void {
     content.style.fontSize = "0.9em";
     content.style.display = "flex";
     content.style.flexDirection = "column";
-    content.style.gap = "0.6em";
-    modal.style.width = "min(28em, 80vw)";
+    content.style.gap = "0.5em";
+    modal.style.width = "min(" + width + ", 80vw)";
 }
 
 function addCredit(parent: HTMLElement): void {
@@ -219,7 +234,7 @@ function createBorderModal(
     modal.onOpen = () => {
         const content = modal.contentEl;
         content.empty();
-        styleModalContent(content, modal.modalEl);
+        styleModalContent(content, modal.modalEl, "36em");
         const scene = ea.getViewElements();
         let candidate = resolveAnchor(ea, scene.find((element) => element.id === state.borderId), scene);
         const candidateText = addText(content, `Border Element: ${logicalLabel(candidate)}`);
@@ -250,9 +265,13 @@ function createBorderModal(
             addRangePair(content, label, -120, 120, nextPadding[side], (value) => {
                 nextPadding[side] = value;
                 schedulePreview();
-            });
+            }, "5em");
         }
         const actions = content.ownerDocument.createElement("div");
+        actions.style.display = "flex";
+        actions.style.justifyContent = "flex-end";
+        actions.style.gap = "0.5em";
+        actions.style.marginTop = "0.5em";
         const save = addButton(actions, "Save");
         const cancel = addButton(actions, "Cancel");
         save.addEventListener("click", () => {
@@ -293,7 +312,7 @@ function createBorderModal(
 export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => void } {
     const scene = ea.getViewElements();
     const state = loadRuntimeState(scene);
-    const indicators: IndicatorState = { ids: [] };
+    const indicators: IndicatorState = { ids: [], records: {} };
     let parsedNodes: NodeIndicator[] = [];
     let parseCurrentMindmap: () => Promise<void> = async () => undefined;
     let connectionTimer: ReturnType<typeof setTimeout> | undefined;
@@ -302,13 +321,10 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
     let renderMain: (refreshInd?: boolean) => void = () => undefined;
     modal.titleEl.textContent = "Automatic Mindmap Layouting";
     modal.onOpen = () => {
-        const startupScene = ea.getViewElements();
-        const startupBorder = resolveAnchor(ea, startupScene.find((element) => element.id === state.borderId), startupScene);
-        parsedNodes = loadNodeIndicators(ea, startupScene, state.rootId, startupBorder);
         renderMain = (refreshInd = true) => {
             const content = modal.contentEl;
             content.empty();
-            styleModalContent(content, modal.modalEl);
+            styleModalContent(content, modal.modalEl, "28em");
             const data = addSection(content, "Mindmap Data");
             const currentScene = ea.getViewElements();
             const border = resolveAnchor(ea, currentScene.find((element) => element.id === state.borderId), currentScene);
@@ -318,6 +334,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                 await refreshConfiguredIndicators(ea, indicators, state, parsedNodes);
                 renderMain();
             }));
+            addSpacer(data, "0.5em");
             const logicalRoot = resolveAnchor(ea, currentScene.find((element) => element.id === state.rootId), currentScene);
             addText(data, `Root Element: ${logicalLabel(logicalRoot)}`);
             const selectRoot = addButton(data, "Select Root Element/Group");
@@ -344,6 +361,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                     });
                 });
             });
+            addSpacer(data, "0.5em");
             const shapeSelect = data.ownerDocument.createElement("select");
             for (const shape of ["ellipse", "rect"] as const) {
                 const option = data.ownerDocument.createElement("option");
@@ -352,7 +370,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                 shapeSelect.appendChild(option);
             }
             data.appendChild(shapeSelect);
-            const applyShape = addButton(data, "Apply To Selection");
+            const applyShape = addButton(data, "Apply Shape To Selection");
             applyShape.addEventListener("click", () => {
                 const shape = normalizeShape(shapeSelect.value);
                 const selected = ea.getViewSelectedElements().filter((element) => (element.customData as Record<string, unknown> | undefined)?.isMindmapNode === true);
@@ -362,6 +380,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                     return refreshConfiguredIndicators(ea, indicators, state, parsedNodes);
                 });
             });
+            addSpacer(data, "0.5em");
             addRangePair(data, "Connection Distance", 1, 300, state.connectionDistance, (value) => {
                 state.connectionDistance = value;
                 if (connectionTimer !== undefined) clearTimeout(connectionTimer);
@@ -370,21 +389,21 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                     if (!rootElement) return;
                     void saveMetadata(ea, [rootElement], [{ id: rootElement.id, patch: { mindmapConnectionDistance: value } }]);
                 }, 120);
-                renderMain(false);
             });
             const parse = addButton(data, "Parse Mindmap");
             parse.disabled = !logicalRoot;
             parseCurrentMindmap = async (): Promise<void> => {
+                showNotice("Parsing Mindmap... This may take a moment for large mindmaps.");
                 if (!logicalRoot) return;
                 const currentScene = ea.getViewElements();
                 const currentRoot = resolveAnchor(ea, currentScene.find((element) => element.id === state.rootId), currentScene);
                 const currentBorder = resolveAnchor(ea, currentScene.find((element) => element.id === state.borderId), currentScene);
                 if (!currentRoot || !currentBorder) return;
-                const parsed = parseMindmap(ea, currentRoot, state.connectionDistance, currentBorder);
+                const parsed = parseMindmap(ea, currentRoot, state.connectionDistance, currentBorder, state.padding);
                 state.graph = parsed.graph;
                 parsedNodes = parsed.nodes.slice(1).map((logical) => {
                     const parent = parsed.nodes.find((candidate) => parsed.graph.getNode(logical.anchor.id)?.parentId === candidate.anchor.id);
-                    const shape = normalizeShape((logical.anchor.customData as Record<string, unknown> | undefined)?.mindmapShape);
+                    const shape = parsed.graph.getNode(logical.anchor.id)?.shape === "rectangle" ? "rectangle" : "ellipse";
                     return parent ? { logical, parent, shape } : { logical, shape };
                 });
                 const sceneNodes = ea.getViewElements().filter((element) => (element.customData as Record<string, unknown> | undefined)?.isMindmapNode === true);
@@ -411,7 +430,9 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                 renderMain(false);
             };
             parse.addEventListener("click", () => void parseCurrentMindmap());
-            addText(data, state.graph ? `Graph Statistics: ${calculateGraphMetricsString(state.graph)}` : "Graph Statistics: Available after parsing");
+            addSpacer(data, "0.5em");
+            addText(data, state.graph ? `Graph Statistics:<br>${calculateGraphMetricsString(state.graph).replace(/\n/g, "<br>")}` : "Graph Statistics: Available after parsing");
+            addSpacer(data, "0.5em");
             const metadataActions = data.ownerDocument.createElement("div");
             metadataActions.style.display = "grid";
             metadataActions.style.gridTemplateColumns = "auto auto";
@@ -450,7 +471,9 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
             defaultOption.textContent = "Default";
             algorithmSelect.appendChild(defaultOption);
             algorithm.appendChild(algorithmSelect);
+            addSpacer(algorithm, "0.5em");
             addRangePair(algorithm, "Steps Per Render", 1, 1000, 1, () => undefined);
+            addSpacer(algorithm, "0.5em");
             addText(algorithm, "Algorithm-Specific Options: Reserved");
 
             const control = addSection(content, "Control");
@@ -460,9 +483,47 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
             firstRow.style.gap = secondRow.style.gap = "0.5em";
             firstRow.style.gridTemplateColumns = "auto auto auto";
             secondRow.style.gridTemplateColumns = "auto auto";
-            for (const label of ["Start", "Step", "Reset"]) addButton(firstRow, label).disabled = true;
-            for (const label of ["Rollback", "Clear Backups"]) addButton(secondRow, label).disabled = true;
+            const start = addButton(firstRow, "Start");
+            start.addEventListener("click", async () => {
+                showNotice("Starting Mindmap Layouting... (This is a placeholder action.)");
+                await createMindmapBackup(ea.plugin.app, ea.targetView?.file!).then((backup) => {
+                    showNotice(`Mindmap Backup Created: ${backup.file.path}`);
+                });
+                renderMain();
+            });
+            for (const label of ["Step", "Reset"]) addButton(firstRow, label).disabled = true;
+            const activeFile = ea.targetView?.file;
+            const backups = activeFile ? listMindmapBackups(ea.plugin.app, activeFile) : [];
+            const rollback = addButton(secondRow, "Rollback");
+            rollback.disabled = !activeFile || backups.length === 0;
+            rollback.addEventListener("click", () => {
+                if (!activeFile) return;
+                confirmAction(ea, "Restore the newest backup for this drawing?", async () => {
+                    try {
+                        const restored = await rollbackLatestMindmapBackup(ea.plugin.app, activeFile);
+                        if (restored) showNotice("Mindmap backup restored.");
+                    } catch {
+                        showNotice("Could not restore the mindmap backup.");
+                    }
+                });
+                renderMain();
+            });
+            const clearBackups = addButton(secondRow, "Clear Backups");
+            clearBackups.disabled = !activeFile || backups.length === 0;
+            clearBackups.addEventListener("click", () => {
+                if (!activeFile) return;
+                confirmAction(ea, "Delete all backups for this drawing?", async () => {
+                    try {
+                        await clearMindmapBackups(ea.plugin.app, activeFile);
+                        showNotice("Mindmap backups cleared.");
+                    } catch {
+                        showNotice("Could not clear the mindmap backups.");
+                    }
+                });
+                renderMain();
+            });
             control.append(firstRow, secondRow);
+            addSpacer(control, "0.5em");
             addText(control, "Current Step / Total Steps: - / -");
             addText(control, "Milliseconds Per Step: Now - | Min - | Average - | Max -");
             addCredit(content);
@@ -471,6 +532,21 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
             }
         };
         void repairRootFlags(ea, state).then(() => {
+            const startupScene = ea.getViewElements();
+            const startupBorder = resolveAnchor(ea, startupScene.find((element) => element.id === state.borderId), startupScene);
+            const startupRoot = resolveAnchor(ea, startupScene.find((element) => element.id === state.rootId), startupScene);
+            if (startupBorder && startupRoot) {
+                const loaded = loadMindmapFromMetadata(ea, startupRoot, startupBorder, state.padding);
+                state.graph = loaded.graph;
+                parsedNodes = loaded.nodes.slice(1).map((logical) => {
+                    const parent = loaded.nodes.find((candidate) => loaded.graph.getNode(logical.anchor.id)?.parentId === candidate.anchor.id);
+                    const shape = loaded.graph.getNode(logical.anchor.id)?.shape === "rectangle" ? "rectangle" : "ellipse";
+                    return parent ? { logical, parent, shape } : { logical, shape };
+                });
+            } else {
+                delete state.graph;
+                parsedNodes = [];
+            }
             renderMain();
         });
     };

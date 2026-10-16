@@ -28,7 +28,7 @@ export const DEFAULT_PADDING: MindmapPadding = {
 export const DEFAULT_RUNTIME_STATE: MindmapRuntimeState = {
     padding: DEFAULT_PADDING,
     rootShape: "ellipse",
-    connectionDistance: 50,
+    connectionDistance: 15,
 };
 
 /**
@@ -100,11 +100,7 @@ export function readPadding(value: Record<string, unknown> | undefined): Mindmap
  * @returns Runtime configuration loaded from element metadata.
  */
 export function loadRuntimeState(elements: readonly ExcalidrawElement[]): MindmapRuntimeState {
-    const state: MindmapRuntimeState = {
-        padding: { ...DEFAULT_PADDING },
-        rootShape: "ellipse",
-        connectionDistance: 50,
-    };
+    const state: MindmapRuntimeState = { ...DEFAULT_RUNTIME_STATE };
 
     for (const element of elements) {
         const customData = element.customData as Record<string, unknown> | undefined;

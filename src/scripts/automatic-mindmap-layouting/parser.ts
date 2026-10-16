@@ -1,6 +1,6 @@
 import p5 from "p5";
 import { TreeGraph, type TreeNode } from "./core/graph/types";
-import { normalizeShape, type MindmapShape } from "./metadata";
+import { normalizeShape, type MindmapPadding, type MindmapShape } from "./metadata";
 import { resolveAnchor, type LogicalElement } from "./groups";
 
 export interface ParsedMindmap {
@@ -94,6 +94,57 @@ function nodeFor(logical: LogicalElement, parentId?: string): TreeNode {
     };
 }
 
+function graphDimensions(border: LogicalElement, padding: MindmapPadding): { width: number; height: number } {
+    return {
+        width: Math.max(1, border.bounds.width - padding.left - padding.right),
+        height: Math.max(1, border.bounds.height - padding.top - padding.bottom),
+    };
+}
+
+function logicalForId(
+    id: string,
+    scene: readonly ExcalidrawElement[],
+    ea: ExcalidrawAutomate,
+): LogicalElement | undefined {
+    return resolveAnchor(ea, scene.find((element) => element.id === id), scene);
+}
+
+/**
+ * Reconstructs a previously parsed graph from persisted parent/children metadata.
+ * The metadata is traversed breadth-first so TreeGraph receives parents first.
+ */
+export function loadMindmapFromMetadata(
+    ea: ExcalidrawAutomate,
+    root: LogicalElement,
+    border: LogicalElement,
+    padding: MindmapPadding = { top: 0, left: 0, bottom: 0, right: 0 },
+): ParsedMindmap {
+    const scene = ea.getViewElements().filter((element) => customData(element).isMindmapTemporary !== true);
+    const dimensions = graphDimensions(border, padding);
+    const graph = new TreeGraph("Mindmap", root.anchor.id, dimensions.width, dimensions.height);
+    const nodes: LogicalElement[] = [root];
+    const queued = new Set<string>([root.anchor.id]);
+    const queue: LogicalElement[] = [root];
+    graph.addNode(nodeFor(root));
+
+    for (let readIndex = 0; readIndex < queue.length; readIndex++) {
+        const parent = queue[readIndex];
+        const children = customData(parent.anchor).mindmapChildren;
+        if (!Array.isArray(children)) continue;
+        for (const childId of children) {
+            if (typeof childId !== "string" || queued.has(childId)) continue;
+            const child = logicalForId(childId, scene, ea);
+            if (!child || customData(child.anchor).isMindmapNode !== true) continue;
+            if (customData(child.anchor).mindmapParent !== parent.anchor.id) continue;
+            queued.add(childId);
+            queue.push(child);
+            nodes.push(child);
+            graph.addNode(nodeFor(child, parent.anchor.id));
+        }
+    }
+    return { graph, nodes };
+}
+
 /**
  * Parses connected canvas nodes breadth-first from the configured root.
  *
@@ -107,13 +158,15 @@ export function parseMindmap(
     root: LogicalElement,
     connectionDistance: number,
     border: LogicalElement,
+    padding: MindmapPadding = { top: 0, left: 0, bottom: 0, right: 0 },
 ): ParsedMindmap {
     const borderIds = new Set(border?.elements.map((element) => element.id));
     const scene = ea.getViewElements().filter((element) => {
         const data = customData(element);
         return data.isMindmapTemporary !== true && data.isMindmapBorder !== true && !borderIds.has(element.id);
     });
-    const graph = new TreeGraph("Mindmap", root.anchor.id, border.bounds.width, border.bounds.height);
+    const dimensions = graphDimensions(border, padding);
+    const graph = new TreeGraph("Mindmap", root.anchor.id, dimensions.width, dimensions.height);
     const queue: LogicalElement[] = [root];
     const nodes: LogicalElement[] = [root];
     const queued = new Set([root.anchor.id]);

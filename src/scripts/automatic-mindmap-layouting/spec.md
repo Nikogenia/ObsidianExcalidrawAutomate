@@ -191,14 +191,16 @@ not mutate the scene.
   normalized shape with the Root metadata.
 - Selecting or saving a Root immediately starts automatic parsing from that
   Root.
-- Show a shape dropdown (`ellipse` / `rect`) and **Apply To Selection**. The
+- Show a shape dropdown (`ellipse` / `rect`) and **Apply Shape To Selection**. The
   action updates only selected elements already marked `isMindmapNode`, both in
   metadata and in their temporary indicators.
-- Show Graph Statistics only after parsing, using
+- Show Graph Statistics after parsing or successful startup graph loading, using
   `calculateGraphMetricsString(graph)`.
 - Provide a Connection Distance input with slider and number field, constrained
-  to `1..300`, defaulting to `50`. Save it in Root metadata and use it during
-  line-endpoint matching.
+  to `1..300`, defaulting to `15`. Save it in Root metadata and use it during
+  line-endpoint matching. Slider and number input changes use the same short
+  debounce as Border Settings and must not rebuild the modal while the control
+  is being dragged.
 - Provide **Parse Mindmap** to discard the current parsed graph and parse again
   from the configured Root.
 - Provide **Clear Mindmap** to remove all Mindmap Node metadata from the current
@@ -284,6 +286,13 @@ the available layout area. Use the root and every parsed node as `TreeNode`
 instances; preserve actual element dimensions because mixed shapes are a core
 research requirement. Positions are `p5.Vector` centers as required by the
 core.
+
+When a configured root and border are present, startup reconstructs the graph
+from persisted `mindmapChildren` and `mindmapParent` metadata in breadth-first,
+parent-first order. This is a read-only hydration path: it does not discover
+new connections or rewrite metadata. Root selection and the explicit Parse
+Mindmap action remain the only operations that run the line-based parser. The
+hydrated graph is used immediately for indicators and graph metrics.
 
 ### 7.1 Core interaction contract
 
@@ -388,8 +397,12 @@ indicators/arrows. They must carry `isMindmapTemporary: true` in
 `customData`. Their IDs are held in runtime state, not persisted in root/node
 metadata.
 
-Indicator refreshes must replace/delete the previous temporary set in one
-coherent unsaved EA transaction (`addElementsToView(false, false)`). The
+Indicator refreshes reconcile stable keys for the border, root, each node, and
+each parent arrow. A geometry/shape signature determines whether an existing
+temporary element can be retained; only changed, removed, or newly required
+indicators participate in the one coherent unsaved EA transaction
+(`addElementsToView(false, false)`). Unknown temporary elements are cleaned up
+when encountered. An unchanged refresh performs no EA scene transaction. The
 initial main-modal open refreshes configured border and root indicators before
 the user opens any child settings modal. Closing the main modal deletes all temporary
 elements, including indicators created by an open child modal. Closing or
@@ -422,10 +435,14 @@ backup. Handle missing files and write failures without deleting the only
 recoverable backup. Clear backups matches the current file exactly and leaves
 backups belonging to other drawings untouched.
 
-The exact current vault path and safe active-view reload sequence must be
-verified against the available Obsidian API before implementation. This is a
-required design checkpoint, not permission to use an undocumented target-view
-internals shortcut.
+The current vault path is `ea.targetView.file.path`; the implementation uses
+`ea.plugin.app.vault` and the active file object rather than target-view
+internals. `Vault.modify(activeFile, restoredContent)` is the safe reload path:
+Obsidian's normal vault event updates the open Excalidraw view. No undocumented
+view reload shortcut is used. The import-safe `backup.ts` helper now implements
+collision-safe creation, exact per-file matching, newest-backup rollback, and
+cleanup of the empty `mindmap-backup` folder. The layout runner still needs to
+call `createMindmapBackup` immediately before its first save-enabled mutation.
 
 ## 11. Lifecycle and Failure Behavior
 
@@ -450,7 +467,9 @@ internals shortcut.
 3. Implement root selection, shape application, and the breadth-first parser.
 4. Add `TreeGraph` construction and graph metrics display.
 5. Add algorithm selection adapter, Step/Start/Reset controls, and run metrics.
-6. Add vault backup, rollback confirmation, restore/reload, and cleanup.
+6. Add vault backup, rollback confirmation, restore/reload, and cleanup. The
+  vault helper and UI rollback/cleanup controls are implemented; the future
+  layout runner must call backup creation before its first save-enabled edit.
 7. Add focused tests for pure metadata, geometry, queue/loop handling, and
    algorithm mapping; then run the repository check/build and an Obsidian smoke
    test covering modal lifecycle, popout/mobile behavior, selection, parsing,
@@ -472,22 +491,22 @@ internals shortcut.
   `isMindmapTemporary`.
 - The UI is implemented through documented EA/Obsidian APIs and does not
   mutate immutable scene elements directly.
-- The spec's unresolved backup path/reload checkpoint is resolved before
-  backup controls are implemented.
+- Backup and rollback controls use the documented vault API and remain disabled
+  when no matching backup exists.
 
 ## 14. First-slice implementation notes
 
-The current implementation includes import-safe metadata loading, group-aware
-logical selection, unsaved indicator/metadata transactions, startup indicator
-refresh, selection notices, debounced border previews, and compact modal
-styling with a clickable credit link. The Border Settings modal uses the
+The current implementation includes import-safe metadata loading, persisted
+graph hydration with automatic metrics, group-aware logical selection, unsaved
+indicator/metadata transactions, startup indicator refresh, selection notices,
+debounced border and connection-distance previews, incremental indicator
+reconciliation, and compact modal styling with a clickable credit link. The Border Settings modal uses the
 documented default positioning; no CSS translation is applied. Border, Root,
-parsed-node, and parent-arrow indicators are rebuilt
-in one transaction; the border therefore remains visible for the full lifetime
-of the main modal, including while Border Settings is open. All temporary
-indicators continue to carry `isMindmapTemporary: true`; child border previews
-replace the complete current set, including parsed node arrows, and all are
-removed when the main modal closes.
+parsed-node, and parent-arrow indicators are reconciled in one transaction only
+when their geometry or shape changes; the border therefore remains visible for
+the full lifetime of the main modal, including while Border Settings is open.
+All temporary indicators continue to carry `isMindmapTemporary: true`, and all
+are removed when the main modal closes.
 
 The startup loader keeps the first root flag in stable scene order. If more
 than one element is flagged as a root, the remaining root flags are removed in
@@ -511,6 +530,7 @@ graph and indicator state are discarded and rebuilt when a new root is chosen
 or parsing is run again.
 
 Confirmed Clear Mindmap and Clear All Metadata actions are implemented through
-unsaved metadata transactions and preserve unrelated custom data. The layout
-algorithm runner and the backup/rollback API checkpoint remain subsequent
-slices.
+unsaved metadata transactions and preserve unrelated custom data. The
+import-safe `backup.ts` module implements complete-file backup creation,
+newest-backup rollback, and exact per-file cleanup; the layout algorithm runner
+still needs to call backup creation before its first save-enabled mutation.
