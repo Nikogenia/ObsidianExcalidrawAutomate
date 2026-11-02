@@ -1,4 +1,4 @@
-import type { App, TFile } from "obsidian";
+import type { App, TFile, TFolder } from "obsidian";
 
 export interface MindmapBackup {
     file: TFile;
@@ -37,6 +37,13 @@ function matchingBackups(app: App, file: TFile): MindmapBackup[] {
         .sort((left, right) => right.run - left.run);
 }
 
+function emptyBackupFolder(app: App, path: string): TFolder | undefined {
+    const folder = app.vault.getAbstractFileByPath(path);
+    if (!folder || !("children" in folder)) return undefined;
+    const hasFiles = app.vault.getFiles().some((file) => file.path.startsWith(`${path}/`));
+    return !hasFiles ? folder as TFolder : undefined;
+}
+
 /** Returns backups belonging exactly to the active drawing file. */
 export function listMindmapBackups(app: App, file: TFile): MindmapBackup[] {
     return matchingBackups(app, file);
@@ -69,12 +76,21 @@ export async function createMindmapBackup(app: App, file: TFile): Promise<Mindma
 }
 
 /** Restores and then consumes the newest backup for the active drawing. */
-export async function rollbackLatestMindmapBackup(app: App, file: TFile): Promise<boolean> {
+export async function rollbackLatestMindmapBackup(
+    app: App,
+    file: TFile,
+    afterRestore?: (content: string) => Promise<void>,
+): Promise<boolean> {
     const backup = matchingBackups(app, file)[0];
     if (!backup) return false;
     const content = await app.vault.read(backup.file);
     await app.vault.modify(file, content);
+    if (afterRestore) await afterRestore(content);
     await app.vault.delete(backup.file);
+    const folder = emptyBackupFolder(app, backupFolderPath(file));
+    if (folder) {
+        await app.vault.delete(folder, true);
+    }
     return true;
 }
 
@@ -82,8 +98,8 @@ export async function rollbackLatestMindmapBackup(app: App, file: TFile): Promis
 export async function clearMindmapBackups(app: App, file: TFile): Promise<void> {
     const backups = matchingBackups(app, file);
     for (const backup of backups) await app.vault.delete(backup.file);
-    const folder = app.vault.getAbstractFileByPath(backupFolderPath(file));
-    if (folder && app.vault.getFiles().every((candidate) => !candidate.path.startsWith(`${folder.path}/`))) {
-        await app.vault.delete(folder);
+    const folder = emptyBackupFolder(app, backupFolderPath(file));
+    if (folder) {
+        await app.vault.delete(folder, true);
     }
 }

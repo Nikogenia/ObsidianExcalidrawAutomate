@@ -108,6 +108,14 @@ async function saveMetadata(
     ea.clear();
 }
 
+async function saveCurrentDrawing(ea: ExcalidrawAutomate): Promise<void> {
+    const scene = ea.getViewElements();
+    ea.clear();
+    ea.copyViewElementsToEAforEditing(scene);
+    await ea.addElementsToView(false, true);
+    ea.clear();
+}
+
 function confirmAction(
     ea: ExcalidrawAutomate,
     message: string,
@@ -175,6 +183,11 @@ function addCredit(parent: HTMLElement): void {
     parent.appendChild(credit);
 }
 
+function reportError(message: string, error: unknown): void {
+    console.error(`[Automatic Mindmap Layouting] ${message}`, error);
+    showNotice(message);
+}
+
 async function refreshConfiguredIndicators(
     ea: ExcalidrawAutomate,
     indicators: IndicatorState,
@@ -204,7 +217,10 @@ function loadNodeIndicators(
         const parentId = (element.customData as Record<string, unknown> | undefined)?.mindmapParent;
         const parentElement = typeof parentId === "string" ? scene.find((candidate) => candidate.id === parentId) : undefined;
         const parent = parentElement ? resolveAnchor(ea, parentElement, scene) : undefined;
-        const shape = normalizeShape((element.customData as Record<string, unknown> | undefined)?.mindmapShape);
+        const data = element.customData as Record<string, unknown> | undefined;
+        const shape = data?.mindmapShape !== undefined
+            ? normalizeShape(data.mindmapShape)
+            : element.type === "ellipse" ? "ellipse" : "rectangle";
         return parent ? [{ logical, parent, shape }] : [{ logical, shape }];
     });
 }
@@ -317,7 +333,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
     let parseCurrentMindmap: () => Promise<void> = async () => undefined;
     let connectionTimer: ReturnType<typeof setTimeout> | undefined;
     const modal = new ea.FloatingModal(ea.plugin.app);
-    let closed = false;
+    let cleanupStarted = false;
     let renderMain: (refreshInd?: boolean) => void = () => undefined;
     modal.titleEl.textContent = "Automatic Mindmap Layouting";
     modal.onOpen = () => {
@@ -485,10 +501,20 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
             secondRow.style.gridTemplateColumns = "auto auto";
             const start = addButton(firstRow, "Start");
             start.addEventListener("click", async () => {
-                showNotice("Starting Mindmap Layouting... (This is a placeholder action.)");
-                await createMindmapBackup(ea.plugin.app, ea.targetView?.file!).then((backup) => {
-                    showNotice(`Mindmap Backup Created: ${backup.file.path}`);
-                });
+                try {
+                    showNotice("Starting Mindmap Layouting... (This is a placeholder action.)");
+                    const file = ea.targetView?.file;
+                    if (!file) {
+                        throw new Error("No drawing is open.");
+                    }
+                    await clearIndicators(ea, indicators, viewApi);
+                    await saveCurrentDrawing(ea);
+                    await createMindmapBackup(ea.plugin.app, file).then((backup) => {
+                        showNotice(`Mindmap Backup Created: ${backup.file.path}`);
+                    });
+                } catch (error) {
+                    reportError("Could not create the mindmap backup.", error);
+                }
                 renderMain();
             });
             for (const label of ["Step", "Reset"]) addButton(firstRow, label).disabled = true;
@@ -500,13 +526,24 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                 if (!activeFile) return;
                 confirmAction(ea, "Restore the newest backup for this drawing?", async () => {
                     try {
-                        const restored = await rollbackLatestMindmapBackup(ea.plugin.app, activeFile);
-                        if (restored) showNotice("Mindmap backup restored.");
-                    } catch {
-                        showNotice("Could not restore the mindmap backup.");
+                        await clearIndicators(ea, indicators, viewApi);
+                        const restored = await rollbackLatestMindmapBackup(
+                            ea.plugin.app,
+                            activeFile,
+                            async () => {
+                                const leaf = ea.targetView?.leaf;
+                                if (!leaf) throw new Error("The drawing view is no longer available.");
+                                await leaf.openFile(activeFile, { active: true });
+                            },
+                        );
+                        if (restored) {
+                            showNotice("Mindmap backup restored.");
+                        }
+                    } catch (error) {
+                        reportError("Could not restore the mindmap backup.", error);
                     }
+                    renderMain();
                 });
-                renderMain();
             });
             const clearBackups = addButton(secondRow, "Clear Backups");
             clearBackups.disabled = !activeFile || backups.length === 0;
@@ -516,11 +553,11 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
                     try {
                         await clearMindmapBackups(ea.plugin.app, activeFile);
                         showNotice("Mindmap backups cleared.");
-                    } catch {
-                        showNotice("Could not clear the mindmap backups.");
+                    } catch (error) {
+                        reportError("Could not clear the mindmap backups.", error);
                     }
+                    renderMain();
                 });
-                renderMain();
             });
             control.append(firstRow, secondRow);
             addSpacer(control, "0.5em");
@@ -551,15 +588,32 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
         });
     };
     modal.onClose = () => {
-        if (closed) return;
-        closed = true;
+        if (cleanupStarted) return;
+        cleanupStarted = true;
         if (connectionTimer !== undefined) clearTimeout(connectionTimer);
-        void clearIndicators(ea, indicators);
+        void clearIndicators(ea, indicators, viewApi).catch((error) => {
+            reportError("Could not remove mindmap indicators before closing the drawing.", error);
+        });
+    };
+    const targetView = ea.targetView;
+    const viewApi = ea.getExcalidrawAPI();
+    const previousUnloadHook = ea.onViewUnloadHook;
+    const closeAndClearIndicators = (): void => {
+        if (cleanupStarted) return;
+        cleanupStarted = true;
+        if (connectionTimer !== undefined) clearTimeout(connectionTimer);
+        modal.close();
+        void clearIndicators(ea, indicators, viewApi).catch((error) => {
+            reportError("Could not remove mindmap indicators before closing the drawing.", error);
+        });
+    };
+    ea.onViewUnloadHook = (view) => {
+        if (view === targetView) closeAndClearIndicators();
+        previousUnloadHook(view);
     };
     ea.registerCleanup(() => {
-        closed = true;
-        if (connectionTimer !== undefined) clearTimeout(connectionTimer);
-        void clearIndicators(ea, indicators);
+        ea.onViewUnloadHook = previousUnloadHook;
+        closeAndClearIndicators();
     });
     modal.open();
     return { close: () => modal.close() };

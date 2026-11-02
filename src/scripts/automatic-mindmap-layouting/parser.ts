@@ -6,11 +6,32 @@ import { resolveAnchor, type LogicalElement } from "./groups";
 export interface ParsedMindmap {
     graph: TreeGraph;
     nodes: LogicalElement[];
+    coordinateSpace: CoordinateSpace;
 }
 
 interface Point {
     x: number;
     y: number;
+}
+
+export interface CoordinateSpace {
+    origin: Point;
+    width: number;
+    height: number;
+}
+
+export function sceneToGraphPoint(point: Point, coordinateSpace: CoordinateSpace): Point {
+    return {
+        x: point.x - coordinateSpace.origin.x,
+        y: point.y - coordinateSpace.origin.y,
+    };
+}
+
+export function graphToScenePoint(point: Point, coordinateSpace: CoordinateSpace): Point {
+    return {
+        x: point.x + coordinateSpace.origin.x,
+        y: point.y + coordinateSpace.origin.y,
+    };
 }
 
 function customData(element: ExcalidrawElement): Record<string, unknown> {
@@ -80,15 +101,21 @@ function nearestCandidate(
     return candidates[0]?.logical;
 }
 
-function nodeFor(logical: LogicalElement, parentId?: string): TreeNode {
+function shapeFor(element: ExcalidrawElement): MindmapShape {
+    const persisted = customData(element).mindmapShape;
+    if (persisted !== undefined) return normalizeShape(persisted);
+    return element.type === "ellipse" ? "ellipse" : "rectangle";
+}
+
+function nodeFor(logical: LogicalElement, parentId: string | undefined, space: CoordinateSpace): TreeNode {
     const point = center(logical);
-    const shape = normalizeShape(customData(logical.anchor).mindmapShape) as MindmapShape;
+    const graphPoint = sceneToGraphPoint(point, space);
     return {
         id: logical.anchor.id,
         ...(parentId ? { parentId } : {}),
         children: [],
-        pos: new p5.Vector(point.x, point.y),
-        shape,
+        pos: new p5.Vector(graphPoint.x, graphPoint.y),
+        shape: shapeFor(logical.anchor),
         width: logical.bounds.width,
         height: logical.bounds.height,
     };
@@ -98,6 +125,17 @@ function graphDimensions(border: LogicalElement, padding: MindmapPadding): { wid
     return {
         width: Math.max(1, border.bounds.width - padding.left - padding.right),
         height: Math.max(1, border.bounds.height - padding.top - padding.bottom),
+    };
+}
+
+function coordinateSpace(border: LogicalElement, padding: MindmapPadding): CoordinateSpace {
+    const dimensions = graphDimensions(border, padding);
+    return {
+        origin: {
+            x: border.bounds.x + padding.left,
+            y: border.bounds.y + padding.top,
+        },
+        ...dimensions,
     };
 }
 
@@ -120,12 +158,12 @@ export function loadMindmapFromMetadata(
     padding: MindmapPadding = { top: 0, left: 0, bottom: 0, right: 0 },
 ): ParsedMindmap {
     const scene = ea.getViewElements().filter((element) => customData(element).isMindmapTemporary !== true);
-    const dimensions = graphDimensions(border, padding);
-    const graph = new TreeGraph("Mindmap", root.anchor.id, dimensions.width, dimensions.height);
+    const space = coordinateSpace(border, padding);
+    const graph = new TreeGraph("Mindmap", root.anchor.id, space.width, space.height);
     const nodes: LogicalElement[] = [root];
     const queued = new Set<string>([root.anchor.id]);
     const queue: LogicalElement[] = [root];
-    graph.addNode(nodeFor(root));
+    graph.addNode(nodeFor(root, undefined, space));
 
     for (let readIndex = 0; readIndex < queue.length; readIndex++) {
         const parent = queue[readIndex];
@@ -139,10 +177,10 @@ export function loadMindmapFromMetadata(
             queued.add(childId);
             queue.push(child);
             nodes.push(child);
-            graph.addNode(nodeFor(child, parent.anchor.id));
+            graph.addNode(nodeFor(child, parent.anchor.id, space));
         }
     }
-    return { graph, nodes };
+    return { graph, nodes, coordinateSpace: space };
 }
 
 /**
@@ -165,13 +203,13 @@ export function parseMindmap(
         const data = customData(element);
         return data.isMindmapTemporary !== true && data.isMindmapBorder !== true && !borderIds.has(element.id);
     });
-    const dimensions = graphDimensions(border, padding);
-    const graph = new TreeGraph("Mindmap", root.anchor.id, dimensions.width, dimensions.height);
+    const space = coordinateSpace(border, padding);
+    const graph = new TreeGraph("Mindmap", root.anchor.id, space.width, space.height);
     const queue: LogicalElement[] = [root];
     const nodes: LogicalElement[] = [root];
     const queued = new Set([root.anchor.id]);
     const parentById = new Map<string, string | undefined>([[root.anchor.id, undefined]]);
-    graph.addNode(nodeFor(root));
+    graph.addNode(nodeFor(root, undefined, space));
 
     for (let readIndex = 0; readIndex < queue.length; readIndex++) {
         const parent = queue[readIndex];
@@ -189,11 +227,11 @@ export function parseMindmap(
             parentById.set(candidate.anchor.id, parent.anchor.id);
             queue.push(candidate);
             nodes.push(candidate);
-            graph.addNode(nodeFor(candidate, parent.anchor.id));
+            graph.addNode(nodeFor(candidate, parent.anchor.id, space));
         }
     }
 
     console.log(`Parsed ${nodes.length} nodes from mindmap. Serialized graph:`);
     console.log(graph.serialize());
-    return { graph, nodes };
+    return { graph, nodes, coordinateSpace: space };
 }

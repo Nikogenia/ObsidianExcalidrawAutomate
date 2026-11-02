@@ -430,16 +430,19 @@ it must be collision-safe. Backups contain the whole original file, not only
 the selected elements. Never overwrite an existing backup.
 
 Rollback selects the newest matching backup only after explicit confirmation,
-restores it to the active file using the vault API, then deletes the consumed
-backup. Handle missing files and write failures without deleting the only
-recoverable backup. Clear backups matches the current file exactly and leaves
-backups belonging to other drawings untouched.
+restores it to the active file using the vault API, updates the mounted
+Excalidraw scene through the public imperative API, and then deletes the
+consumed backup. Handle missing files and write failures without deleting the
+only recoverable backup. Clear backups matches the current file exactly and
+leaves backups belonging to other drawings untouched.
 
 The current vault path is `ea.targetView.file.path`; the implementation uses
 `ea.plugin.app.vault` and the active file object rather than target-view
-internals. `Vault.modify(activeFile, restoredContent)` is the safe reload path:
-Obsidian's normal vault event updates the open Excalidraw view. No undocumented
-view reload shortcut is used. The import-safe `backup.ts` helper now implements
+internals. `Vault.modify(activeFile, restoredContent)` restores the persisted file, but an
+already-mounted Excalidraw editor may retain its in-memory scene. The rollback
+callback therefore parses the restored document and calls the public
+imperative API's `updateScene` before consuming the backup. No undocumented
+view reload shortcut is used. The import-safe `backup.ts` helper implements
 collision-safe creation, exact per-file matching, newest-backup rollback, and
 cleanup of the empty `mindmap-backup` folder. The layout runner still needs to
 call `createMindmapBackup` immediately before its first save-enabled mutation.
@@ -532,5 +535,47 @@ or parsing is run again.
 Confirmed Clear Mindmap and Clear All Metadata actions are implemented through
 unsaved metadata transactions and preserve unrelated custom data. The
 import-safe `backup.ts` module implements complete-file backup creation,
-newest-backup rollback, and exact per-file cleanup; the layout algorithm runner
-still needs to call backup creation before its first save-enabled mutation.
+newest-backup rollback, and exact per-file cleanup. The current Start action
+clears temporary indicators, saves the current scene once, and then creates
+the backup; the future layout algorithm runner must retain that ordering before
+its first layout mutation.
+
+## 15. Correctness Notes and Key Changes
+
+The parser must not treat absent `mindmapShape` metadata as evidence of an
+ellipse. During the first parse, metadata for newly discovered nodes does not
+yet exist, so the fallback is the element's actual Excalidraw type:
+`ellipse` remains an ellipse and every other supported node shape is represented
+as `rectangle`. The same fallback is used by startup node indicators and root
+indicators, so the first render and later reparses agree.
+
+Graph coordinates are simulation coordinates, not Excalidraw scene
+coordinates. The graph origin is the top-left corner of the padded border
+region:
+
+```text
+graph.x = scene.x - (border.x + padding.left)
+graph.y = scene.y - (border.y + padding.top)
+scene.x = graph.x + (border.x + padding.left)
+scene.y = graph.y + (border.y + padding.top)
+```
+
+`ParsedMindmap.coordinateSpace` stores this origin and the usable width and
+height. `sceneToGraphPoint` and `graphToScenePoint` are the shared conversion
+helpers; future algorithm position updates must convert graph positions back
+through `graphToScenePoint` before editing Excalidraw elements. Indicators remain
+scene overlays and therefore use the original logical element bounds directly.
+
+Temporary indicators are cleared before backup creation and on every modal or
+EA cleanup path. Indicator cleanup removes all elements marked
+`isMindmapTemporary` directly through `ea.deleteViewElements`, so it is
+synchronous and does not race EA target-view destruction. The workbench
+installs `ea.onViewUnloadHook`, which runs before the Excalidraw target view is
+invalidated, closes the modal, and performs that synchronous removal while EA
+still has a valid target. Rollback restores the complete file through Obsidian and reopens it through the
+originating `WorkspaceLeaf`, allowing Excalidraw to parse both raw JSON and its
+compressed Markdown drawing format. The backup is consumed only after that
+reopen succeeds. All caught failures are also written with `console.error`
+before the user notice is shown. Clearing the final backup deletes the empty
+`mindmap-backup` folder itself while preserving folders that still contain any
+files.

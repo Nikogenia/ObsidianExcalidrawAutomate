@@ -1,5 +1,7 @@
-import type { MindmapPadding, MindmapShape } from "./metadata";
+import { normalizeShape, type MindmapPadding, type MindmapShape } from "./metadata";
 import type { LogicalElement } from "./groups";
+
+type ExcalidrawImperativeAPI = ReturnType<ExcalidrawAutomate["getExcalidrawAPI"]>;
 
 export interface IndicatorState {
     ids: string[];
@@ -128,9 +130,10 @@ export async function refreshIndicators(
         });
     }
     if (root) {
-        const rootShape = (root.anchor.customData as Record<string, unknown> | undefined)?.mindmapShape === "rectangle"
-            ? "rectangle"
-            : "ellipse";
+        const rootData = root.anchor.customData as Record<string, unknown> | undefined;
+        const rootShape = rootData?.mindmapShape !== undefined
+            ? normalizeShape(rootData.mindmapShape)
+            : root.anchor.type === "ellipse" ? "ellipse" : "rectangle";
         specs.push({
             key: "root",
             signature: JSON.stringify([rootShape, root.bounds]),
@@ -203,6 +206,25 @@ function centerOf(logical: LogicalElement): { x: number; y: number } {
 export async function clearIndicators(
     ea: ExcalidrawAutomate,
     indicatorState: IndicatorState,
+    api?: ExcalidrawImperativeAPI,
 ): Promise<void> {
-    await reconcileIndicators(ea, indicatorState, []);
+    const scene = api?.getSceneElementsIncludingDeleted() ?? ea.getViewElements();
+    const temporary = scene.filter((element) => {
+        const data = element.customData as Record<string, unknown> | undefined;
+        return data?.isMindmapTemporary === true;
+    });
+    if (temporary.length === 0) {
+        indicatorState.records = {};
+        indicatorState.ids = [];
+        return;
+    }
+    if (api) {
+        api.updateScene({
+            elements: scene.filter((element) => !temporary.some((candidate) => candidate.id === element.id)),
+        });
+    } else {
+        ea.deleteViewElements(temporary);
+    }
+    indicatorState.records = {};
+    indicatorState.ids = [];
 }
