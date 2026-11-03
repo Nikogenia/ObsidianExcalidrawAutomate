@@ -1,7 +1,7 @@
 import p5 from "p5";
 import { TreeGraph, type TreeNode } from "./core/graph/types";
-import { normalizeShape, type MindmapPadding, type MindmapShape } from "./metadata";
-import { resolveAnchor, type LogicalElement } from "./groups";
+import { shapeOf, type MindmapPadding } from "./metadata";
+import { containerIdOf, resolveAnchor, type LogicalElement } from "./groups";
 
 export interface ParsedMindmap {
     graph: TreeGraph;
@@ -49,7 +49,7 @@ function distanceToBoundary(point: Point, logical: LogicalElement): number {
     const position = center(logical);
     const dx = point.x - position.x;
     const dy = point.y - position.y;
-    if (logical.anchor.type === "ellipse") {
+    if (shapeOf(logical.anchor) === "ellipse") {
         const radiusX = Math.max(logical.bounds.width / 2, 1);
         const radiusY = Math.max(logical.bounds.height / 2, 1);
         const normalizedDistance = Math.sqrt((dx * dx) / (radiusX * radiusX) + (dy * dy) / (radiusY * radiusY));
@@ -82,29 +82,48 @@ function isLoop(candidateId: string, parentId: string, parentById: Map<string, s
     return false;
 }
 
-function nearestCandidate(
-    endpoint: Point,
-    scene: readonly ExcalidrawElement[],
-    excludedIds: ReadonlySet<string>,
-    connectionDistance: number,
-    ea: ExcalidrawAutomate,
-): LogicalElement | undefined {
-    const candidates: { logical: LogicalElement; distance: number; order: number }[] = [];
-    scene.forEach((element, order) => {
-        if (excludedIds.has(element.id) || element.type === "line" || element.type === "arrow") return;
-        const logical = resolveAnchor(ea, element, scene);
-        if (!logical || logical.anchor.id !== element.id) return;
-        const distance = distanceToBoundary(endpoint, logical);
-        if (distance <= connectionDistance) candidates.push({ logical, distance, order });
-    });
-    candidates.sort((left, right) => left.distance - right.distance || left.order - right.order);
-    return candidates[0]?.logical;
+interface Candidate {
+    logical: LogicalElement;
+    order: number;
 }
 
-function shapeFor(element: ExcalidrawElement): MindmapShape {
-    const persisted = customData(element).mindmapShape;
-    if (persisted !== undefined) return normalizeShape(persisted);
-    return element.type === "ellipse" ? "ellipse" : "rectangle";
+/**
+ * Resolves every element that may become a node exactly once per parse.
+ * Lines, arrows, and container-bound text are never candidates; a group is
+ * represented once, by its anchor.
+ */
+function nodeCandidates(scene: readonly ExcalidrawElement[], ea: ExcalidrawAutomate): Candidate[] {
+    const candidates: Candidate[] = [];
+    scene.forEach((element, order) => {
+        if (element.type === "line" || element.type === "arrow" || containerIdOf(element) !== undefined) return;
+        const logical = resolveAnchor(ea, element, scene);
+        if (logical && logical.anchor.id === element.id) candidates.push({ logical, order });
+    });
+    return candidates;
+}
+
+/**
+ * Returns the eligible element nearest to a line endpoint.
+ *
+ * Already queued elements stay in the candidate set on purpose. Excluding them
+ * would make a line back to an already parsed node (for example the edge to the
+ * parent) resolve to the next-nearest unrelated element. The caller rejects a
+ * queued result instead.
+ */
+function nearestCandidate(
+    endpoint: Point,
+    candidates: readonly Candidate[],
+    connectionDistance: number,
+): LogicalElement | undefined {
+    let best: { logical: LogicalElement; distance: number; order: number } | undefined;
+    for (const { logical, order } of candidates) {
+        const distance = distanceToBoundary(endpoint, logical);
+        if (distance > connectionDistance) continue;
+        if (!best || distance < best.distance || (distance === best.distance && order < best.order)) {
+            best = { logical, distance, order };
+        }
+    }
+    return best?.logical;
 }
 
 function nodeFor(logical: LogicalElement, parentId: string | undefined, space: CoordinateSpace): TreeNode {
@@ -115,7 +134,7 @@ function nodeFor(logical: LogicalElement, parentId: string | undefined, space: C
         ...(parentId ? { parentId } : {}),
         children: [],
         pos: new p5.Vector(graphPoint.x, graphPoint.y),
-        shape: shapeFor(logical.anchor),
+        shape: shapeOf(logical.anchor),
         width: logical.bounds.width,
         height: logical.bounds.height,
     };
@@ -139,13 +158,6 @@ function coordinateSpace(border: LogicalElement, padding: MindmapPadding): Coord
     };
 }
 
-function logicalForId(
-    id: string,
-    scene: readonly ExcalidrawElement[],
-    ea: ExcalidrawAutomate,
-): LogicalElement | undefined {
-    return resolveAnchor(ea, scene.find((element) => element.id === id), scene);
-}
 
 /**
  * Reconstructs a previously parsed graph from persisted parent/children metadata.
@@ -163,6 +175,7 @@ export function loadMindmapFromMetadata(
     const nodes: LogicalElement[] = [root];
     const queued = new Set<string>([root.anchor.id]);
     const queue: LogicalElement[] = [root];
+    const byId = new Map(scene.map((element) => [element.id, element]));
     graph.addNode(nodeFor(root, undefined, space));
 
     for (let readIndex = 0; readIndex < queue.length; readIndex++) {
@@ -171,7 +184,7 @@ export function loadMindmapFromMetadata(
         if (!Array.isArray(children)) continue;
         for (const childId of children) {
             if (typeof childId !== "string" || queued.has(childId)) continue;
-            const child = logicalForId(childId, scene, ea);
+            const child = resolveAnchor(ea, byId.get(childId), scene);
             if (!child || customData(child.anchor).isMindmapNode !== true) continue;
             if (customData(child.anchor).mindmapParent !== parent.anchor.id) continue;
             queued.add(childId);
@@ -210,6 +223,7 @@ export function parseMindmap(
     const queued = new Set([root.anchor.id]);
     const parentById = new Map<string, string | undefined>([[root.anchor.id, undefined]]);
     graph.addNode(nodeFor(root, undefined, space));
+    const candidates = nodeCandidates(scene, ea);
 
     for (let readIndex = 0; readIndex < queue.length; readIndex++) {
         const parent = queue[readIndex];
@@ -220,8 +234,8 @@ export function parseMindmap(
             const nearEnd = distanceToBoundary(endpoints[1], parent) <= connectionDistance;
             if (!nearStart && !nearEnd) continue;
             const endpoint = nearStart ? endpoints[1] : endpoints[0];
-            const candidate = nearestCandidate(endpoint, scene, queued, connectionDistance, ea);
-            if (!candidate || candidate.anchor.id === parent.anchor.id) continue;
+            const candidate = nearestCandidate(endpoint, candidates, connectionDistance);
+            if (!candidate || queued.has(candidate.anchor.id)) continue;
             if (isLoop(candidate.anchor.id, parent.anchor.id, parentById)) continue;
             queued.add(candidate.anchor.id);
             parentById.set(candidate.anchor.id, parent.anchor.id);

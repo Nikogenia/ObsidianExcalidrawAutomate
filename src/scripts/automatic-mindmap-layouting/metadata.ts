@@ -56,6 +56,23 @@ export function normalizeShape(value: unknown): MindmapShape {
 }
 
 /**
+ * Returns the effective node shape of an anchor element.
+ *
+ * Persisted `mindmapShape` metadata wins. Without metadata the Excalidraw type
+ * decides: `ellipse` stays an ellipse and every other element type (rectangle,
+ * diamond, text, image, ...) is treated as a rectangle. Do not pass the raw
+ * element type to `normalizeShape`, which maps unknown values to ellipse.
+ *
+ * @param element Anchor element.
+ * @returns The normalized shape.
+ */
+export function shapeOf(element: ExcalidrawElement): MindmapShape {
+    const persisted = getCustomDataValue(element.customData as Record<string, unknown> | undefined, "mindmapShape");
+    if (persisted !== undefined) return normalizeShape(persisted);
+    return element.type === "ellipse" ? "ellipse" : "rectangle";
+}
+
+/**
  * Clamps a numeric setting and rounds it to the integer contract.
  *
  * @param value Candidate number.

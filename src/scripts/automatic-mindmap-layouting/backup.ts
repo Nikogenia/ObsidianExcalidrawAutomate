@@ -1,4 +1,4 @@
-import type { App, TFile, TFolder } from "obsidian";
+import type { App, TFile, TFolder, WorkspaceLeaf } from "obsidian";
 
 export interface MindmapBackup {
     file: TFile;
@@ -75,17 +75,56 @@ export async function createMindmapBackup(app: App, file: TFile): Promise<Mindma
     }
 }
 
-/** Restores and then consumes the newest backup for the active drawing. */
+export interface RollbackHooks {
+    /**
+     * Runs after the backup was read and before the drawing file is written.
+     * Must close every open editor of the file (see `closeViewsOfFile`).
+     */
+    beforeWrite: () => Promise<void>;
+    /** Runs after the drawing file was written, typically to reopen it. */
+    afterWrite: () => Promise<void>;
+}
+
+/**
+ * Closes every workspace leaf that currently shows `file` and returns the
+ * leaves so one of them can reopen the restored drawing.
+ *
+ * An open Excalidraw view must not see the restore: when a view saved within
+ * the last five minutes, the plugin handles an external `modify` with
+ * `synchronizeWithData`, a merge that keeps whichever element has the higher
+ * `version`. Backup elements are older, so the live scene wins, and the dirty
+ * view then autosaves the merged scene over the restored file.
+ * `setViewState` awaits `View.close()`, i.e. the view's final save and the
+ * destruction of its script EA instances, before resolving.
+ */
+export async function closeViewsOfFile(app: App, file: TFile): Promise<WorkspaceLeaf[]> {
+    const leaves: WorkspaceLeaf[] = [];
+    app.workspace.iterateAllLeaves((leaf) => {
+        const view = leaf.view as { file?: TFile | null };
+        if (view.file === file) leaves.push(leaf);
+    });
+    for (const leaf of leaves) await leaf.setViewState({ type: "empty" });
+    return leaves;
+}
+
+/**
+ * Restores and then consumes the newest backup for the drawing.
+ *
+ * The backup is read before anything is changed and deleted only after the
+ * drawing was written and reopened, so a failure never loses the only
+ * recoverable copy.
+ */
 export async function rollbackLatestMindmapBackup(
     app: App,
     file: TFile,
-    afterRestore?: (content: string) => Promise<void>,
+    hooks: RollbackHooks,
 ): Promise<boolean> {
     const backup = matchingBackups(app, file)[0];
     if (!backup) return false;
     const content = await app.vault.read(backup.file);
+    await hooks.beforeWrite();
     await app.vault.modify(file, content);
-    if (afterRestore) await afterRestore(content);
+    await hooks.afterWrite();
     await app.vault.delete(backup.file);
     const folder = emptyBackupFolder(app, backupFolderPath(file));
     if (folder) {

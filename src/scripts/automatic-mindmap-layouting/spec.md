@@ -29,6 +29,14 @@ elements.
 ```text
 src/scripts/automatic-mindmap-layouting/
   main.ts                         Executable Script Engine bootstrap
+  ui.ts                           Main modal, Border Settings, UI actions
+  session.ts                      View binding, hook server, listeners, teardown
+  indicators.ts                   Indicator model, sync, selection mapping
+  scene.ts                        Transaction queue and scene write helpers
+  groups.ts                       Logical element (group/bound text) resolution
+  metadata.ts                     Metadata defaults, validation, shape rule
+  parser.ts                       Line parser and metadata hydration
+  backup.ts                       Vault backups and rollback
   preview.svg                     Script preview asset
   README.md                       Script-facing documentation
   spec.md                         This implementation specification
@@ -56,17 +64,33 @@ imported by automated tests.
   `ea.clear()`, copy the required elements with
   `ea.copyViewElementsToEAforEditing(...)`, modify the workbench copies, and
   commit one transaction with `await ea.addElementsToView(false, false)`.
-- UI metadata changes and temporary indicator transactions must not save the
-  open drawing file. The only save-enabled transaction is the explicit save
-  immediately before creating a backup for a layout run. This keeps preview,
-  selection, and configuration work from unexpectedly writing the active file.
+- Copy elements into the workbench **immediately** before the edit, re-read by
+  ID from the current scene (`scene.ts: saveMetadata`). Copying a snapshot taken
+  earlier (for example when the user clicked "Use Selected") writes the old
+  geometry back and silently reverts moves made in the meantime.
+- All workbench transactions run through one `TransactionQueue`
+  (`session.run(...)`). The EA workbench is shared state; an `ea.clear()` from a
+  second transaction while the first awaits `addElementsToView` drops elements.
+- UI metadata changes and temporary indicator transactions pass `save = false`.
+  This does **not** keep them out of the file: `save = false` only marks the
+  view dirty and the plugin autosave (default every 60 s on desktop, 30 s on
+  mobile) writes the whole scene, indicators included (see 3.2.3). The only
+  explicitly save-enabled transaction is the save immediately before creating a
+  backup.
+- Undo capture: workbench-owned changes (indicators, metadata) use
+  `captureUpdate: "NEVER"` so Ctrl+Z neither resurrects indicators nor silently
+  removes root/border flags behind the runtime state. Content moves caused by
+  dragging an indicator use `"IMMEDIATELY"` and are undoable like a native move.
 - Merge metadata with `ea.addAppendUpdateCustomData(id, patch)` so plugin or
-  user metadata is preserved.
+  user metadata is preserved. A patch value of `undefined` removes the key.
 - Temporary indicators are scene elements only while the main modal is open.
   Every temporary element is marked with `isMindmapTemporary: true` and is
-  deleted/cleaned up when the modal closes. Cleanup must also run on failure.
-- Use the current view's document/window for DOM work and register listeners,
-  timers, and observers with `ea.registerCleanup`.
+  deleted when the session ends (section 11). Leftovers from a session that
+  could not clean up are deleted by the next session's first sync.
+- Use the current view's document/window for DOM work. External listeners,
+  timers, and subscriptions are owned by the `WorkbenchSession` and released in
+  its teardown; the session additionally registers its teardown with
+  `ea.registerCleanup` as a last resort.
 
 ### 3.1 Group handling
 
@@ -91,6 +115,112 @@ The anchor represents the group's node geometry while the full member list is
 used for bounds and later movement. Group layout must move or update all group
 members together and must preserve their IDs and unrelated metadata.
 
+Container-bound text (`text.containerId`) needs special handling because it is
+linked by `containerId`, not by `groupIds`:
+
+- `ea.getViewSelectedElements()` adds the bound text of every selected
+  container, and `getMaximumGroups` treats an ungrouped bound text as a group
+  of its own. A plain labelled rectangle therefore used to be rejected as an
+  "ambiguous" selection. `normalizeBoundText` folds bound text into its
+  container (and maps a lone selected label to its container) before grouping.
+- `getElementsInTheSameGroupWithElement(container)` does not return the bound
+  text of an ungrouped container. `LogicalElement.elements` adds it explicitly,
+  so moving a logical element moves its label too.
+- Bound text is never an anchor and never a parser candidate.
+
+### 3.2 Obsidian and Excalidraw plugin runtime model
+
+Findings from the Obsidian 1.14.5 app bundle and the Excalidraw plugin 2.27.3
+bundle (`main.js`). They explain the close, save, and rollback behavior and
+must be rechecked when either is upgraded.
+
+#### 3.2.1 Script EA instances
+
+The Script Engine creates one EA per script run, bound to the active view
+(`ea.targetView`) and registered in `scriptEngine.eaInstances`. The instance
+outlives `main()`: the floating modal keeps using it. It is destroyed by
+`scriptEngine.removeViewEAs(view)` when its view closes; `destroy()` runs the
+`registerCleanup` callbacks first and then clears its state (`targetView`,
+`plugin`, ...). Code that continues after the view closed must not touch `ea`
+any more; the workbench captures `app`, `file`, `leaf`, the imperative API, and
+`ea.obsidian.Notice` up front.
+
+#### 3.2.2 View close order
+
+Obsidian's `WorkspaceLeaf.open` awaits the old view's `View.close()`, which is
+`containerEl.detach(); this.unload(); await this.onClose()`:
+
+1. `Component.unload()` sets `_loaded = false` **first**, unloads children and
+   events, then calls `ExcalidrawView.onunload()`. That calls
+   `getHookServer().onViewUnloadHook(view)` synchronously. The React editor is
+   still mounted at this point.
+2. `ExcalidrawView.onClose()` calls `forceSaveIfRequired()` (the final save),
+   unmounts the React root, and only then calls `removeViewEAs(view)`, which
+   destroys the script EA and runs its `registerCleanup` callbacks.
+
+Consequences:
+
+- `registerCleanup` runs after the final save, so it can never keep indicators
+  out of the file.
+- Inside `onViewUnloadHook`, every EA view method guarded by
+  `targetView._loaded` (`getExcalidrawAPI`, `getViewElements`,
+  `deleteViewElements`, `addElementsToView`, ...) fails and logs
+  **"targetView not set"**. The imperative API captured at startup still works,
+  and `api.updateScene` applies synchronously, so a removal there is part of
+  the scene that `forceSaveIfRequired` saves next.
+
+#### 3.2.3 Saving
+
+`addElementsToView(..., save)` ends in `save ? await view.save(false) :
+view.setDirty()`. With autosave enabled, a dirty view is saved on the next
+autosave tick, on `onUnloadFile` (switching files in the same tab), and on
+close. `forceSaveIfRequired` compares the current scene version with the last
+saved one, so removing indicators that were never saved does not trigger an
+extra save.
+
+#### 3.2.4 Hook server
+
+Hooks (`onViewUnloadHook`, `onSceneChangeHook`, `onLinkClickHook`, `onDropHook`,
+...) are only read from the view's *hook server*: `view.getHookServer()`
+returns `view.hookServer ?? plugin.ea` (= `window.ExcalidrawAutomate`).
+Assigning `ea.onViewUnloadHook` on the script's EA has no effect until the
+script calls `ea.registerThisAsViewEA()`. The view keeps one hook server, so a
+registered script shadows hooks set on `window.ExcalidrawAutomate` (for example
+by a startup script) for that view. `deregisterThisAsViewEA()` in 2.27.x calls
+`setHookServer(this)` again instead of resetting it; the session therefore
+resets with the view's own `setHookServer()` (no argument = plugin EA) when that
+method exists. Sidepanel EAs additionally receive `onSceneChangeHook`.
+
+#### 3.2.5 External file modification
+
+`FileManager.modifyEventHandler` reacts to a vault `modify` of a file that is
+open in an Excalidraw view:
+
+- If the view's `lastSaveTimestamp` is older than five minutes, it fully
+  reloads the view from disk.
+- Otherwise it calls `view.synchronizeWithData(...)`, a **merge**: an incoming
+  element replaces the live one only if its `version` is higher (or equal with
+  different content); live elements missing from the file are kept; live
+  tombstones stay deleted. If the view is dirty afterwards, it autosaves the
+  merged scene immediately.
+
+A backup is always older than the live scene, so restoring it into an open view
+loses this merge on every element that changed since the backup. This is why
+the original rollback recovered nodes "only sometimes" and lost position
+changes, and why the merged autosave then overwrote the restored file.
+Rollback must close every view of the file before writing it (section 10).
+
+#### 3.2.6 Imperative API events
+
+`ea.getExcalidrawAPI()` exposes `onChange`, `onPointerDown`, `onPointerUp`
+(each returns an unsubscribe function), `selectElements`, `refreshAllArrows`,
+`updateScene({ elements, captureUpdate })`, `getSceneElementsIncludingDeleted`,
+and `isDestroyed`. These do not depend on the hook server and are the
+workbench's scene-change source. `onChange` fires for every app-state change
+(selection, scroll, zoom, every pointer move during a drag), so the session
+debounces it, ignores it while the pointer is down, and compares a cheap scene
+version (element count + sum of element versions) before doing any work.
+
 ## 4. Persistent Metadata Contract
 
 Metadata is stored on the relevant persistent element using merged
@@ -110,11 +240,13 @@ Metadata is stored on the relevant persistent element using merged
 }
 ```
 
-Padding values are integers in `[-120, 120]`; the default is `0` for each
-side. On startup, scan the current scene for `isMindmapBorder === true`, load
-the element and valid padding into runtime state, and silently continue without
-a preview if none exists. If multiple elements are marked, use the first
-valid match deterministically, show a warning and remove the flag from the other elements.
+Padding values are integers in `[-120, 120]`. A new border starts with
+`DEFAULT_PADDING` (top `90`, left `100`, bottom `110`, right `100`); a
+malformed persisted side falls back to `0`. On startup, scan the current scene
+for `isMindmapBorder === true`, load the element and valid padding into runtime
+state, and silently continue without a preview if none exists. If multiple
+elements are marked, the first match in scene order is used. Removing the
+other border flags with a warning (as is done for roots) is not implemented yet.
 
 ### Root element
 
@@ -127,10 +259,17 @@ valid match deterministically, show a warning and remove the flag from the other
 }
 ```
 
-`mindmapConnectionDistance` is an integer in `[1, 300]` and defaults to `50`.
+`mindmapConnectionDistance` is an integer in `[1, 300]`. The runtime default
+is `15`; a malformed persisted value falls back to `50`.
 `mindmapShape` is the normalized `TreeNode.shape` value. The UI may label the
 rectangle option `rect`, but graph data must use `rectangle`, matching the core
 types and evaluation functions.
+
+The effective shape of any anchor is `metadata.ts: shapeOf(element)`: persisted
+`mindmapShape` wins; otherwise `ellipse` elements are ellipses and every other
+element type is a rectangle. Parser, indicators, root selection, and hydration
+all use this one rule. (`normalizeShape` must only be applied to persisted or UI
+values: it maps unknown inputs such as `"diamond"` to `ellipse`.)
 
 ### Node elements
 
@@ -152,6 +291,20 @@ The main modal title is **Automatic Mindmap Layouting**. It is opened as soon
 as the script runs. If no element is selected, the script still opens the UI;
 selection-dependent actions explain their missing selection in the UI and do
 not mutate the scene.
+
+**Selections through indicators.** Indicators lie on top of their content, so
+a click usually selects the indicator. Every selection-driven action (Use
+Selected Element/Group, Select Root Element/Group, Apply Shape To Selection)
+first maps selected indicators to their owner via
+`customData.mindmapIndicatorOwner` (`resolveIndicatorOwners`) and folds bound
+text into its container. Selecting an indicator is therefore equivalent to
+selecting its node; selecting both the node and its indicator is not
+ambiguous.
+
+The modal is rendered from runtime state. A scene change re-renders it only
+when border/root/graph presence changed (for example the root was deleted or
+restored with undo); otherwise only the graph statistics text is updated, so
+sliders are not rebuilt while the user drags them.
 
 ### 5.1 Mindmap Data
 
@@ -184,25 +337,29 @@ not mutate the scene.
 
 - Show the configured Root Element's type and ID. If absent, show **Select Root
   Element/Group**.
-- Root selection uses the current canvas selection and must be unambiguous.
+- Root selection uses the current canvas selection (indicators mapped to their
+  owners) and must be unambiguous.
 - An ambiguous Root selection shows a notice and does not mutate metadata.
-- For a selected group, inspect its largest/boundary-like element and choose
-  the shape that best matches the group's dimensions. Persist the chosen
-  normalized shape with the Root metadata.
+- The Root's shape is `shapeOf(anchor)` of the group's largest element, so an
+  existing `mindmapShape` (for example one set with Apply Shape) is kept.
+  Persist the normalized shape with the Root metadata.
 - Selecting or saving a Root immediately starts automatic parsing from that
   Root.
 - Show a shape dropdown (`ellipse` / `rect`) and **Apply Shape To Selection**. The
-  action updates only selected elements already marked `isMindmapNode`, both in
+  action resolves the selection (content or indicators) to logical anchors and
+  updates those already marked `isMindmapNode` (the root included), both in
   metadata and in their temporary indicators.
 - Show Graph Statistics after parsing or successful startup graph loading, using
-  `calculateGraphMetricsString(graph)`.
+  `calculateGraphMetricsString(graph)`. Statistics follow moved and deleted
+  content (the graph is re-hydrated after every scene change).
 - Provide a Connection Distance input with slider and number field, constrained
   to `1..300`, defaulting to `15`. Save it in Root metadata and use it during
   line-endpoint matching. Slider and number input changes use the same short
   debounce as Border Settings and must not rebuild the modal while the control
   is being dragged.
 - Provide **Parse Mindmap** to discard the current parsed graph and parse again
-  from the configured Root.
+  from the configured Root. Parsing needs a Root and a Border (the Border
+  defines the graph coordinate space); a missing one is reported with a notice.
 - Provide **Clear Mindmap** to remove all Mindmap Node metadata from the current
   scene and discard the current parsed graph. This action does not remove the
   Border or Root flags, but it does remove node flags and parent/children
@@ -230,8 +387,10 @@ Provide **Start**, **Step**, **Reset**, **Rollback**, and **Clear Backups**.
   disabled if the algorithm wasn't started or reseted yet and isn't completed or running.
 - **Reset** initializes execution from the parsed graph and resets run metrics;
   it does not discard user configuration.
-- **Rollback** asks for confirmation in an Obsidian modal, loads the newest
-  backup for the current file into the main file, then removes that backup.
+- **Rollback** asks for confirmation in an Obsidian modal, restores the newest
+  backup for the current file (closing and reopening the drawing, section 10),
+  then removes that backup. The workbench ends with the closed view; the user
+  starts the script again on the reopened drawing.
 - **Clear Backups** removes all backups for the current file. If the backup
   folder is empty afterward, remove the folder as well.
 
@@ -259,12 +418,19 @@ inserted first; nodes are never removed from the queue. For each queued node:
 1. Inspect line/arrow elements whose start or end is within the configured
   Connection Distance of the node boundary. The configured Border Element and
   every member of its group are excluded from candidates.
-2. For ellipse nodes, use the ellipse boundary/intersection geometry rather
-   than only an axis-aligned rectangle.
+2. For nodes whose effective shape (`shapeOf`) is ellipse, use the ellipse
+   boundary geometry rather than only an axis-aligned rectangle. A shape set
+   with Apply Shape therefore also changes connection matching.
 3. Resolve the opposite line endpoint to the nearest eligible canvas element.
-4. Ignore the candidate if it is the current node, already queued, already
-   parsed as a child of this parent, or would introduce a loop. A loop must not
-   abort parsing of other branches.
+   Eligible elements (logical anchors that are not lines, arrows, or bound
+   text) are resolved once per parse, not once per line.
+4. Ignore the candidate if it is the current node, already queued, or would
+   introduce a loop. A loop must not abort parsing of other branches.
+   Already queued elements stay **in** the nearest-candidate search and are
+   rejected afterwards. Excluding them from the search (the earlier behavior)
+   made the line back to a node's own parent resolve to the next-nearest
+   unrelated element near the parent, which was then wrongly attached as a
+   child; a container's own bound label could be attached the same way.
 5. Mark a newly accepted element as a node, infer `ellipse` or `rectangle`
    (but only if no shape data is already present in customData),
    store parent/children metadata, and append its ID to the parent's
@@ -287,12 +453,22 @@ instances; preserve actual element dimensions because mixed shapes are a core
 research requirement. Positions are `p5.Vector` centers as required by the
 core.
 
-When a configured root and border are present, startup reconstructs the graph
+When a configured root and border are present, the graph is reconstructed
 from persisted `mindmapChildren` and `mindmapParent` metadata in breadth-first,
 parent-first order. This is a read-only hydration path: it does not discover
 new connections or rewrite metadata. Root selection and the explicit Parse
-Mindmap action remain the only operations that run the line-based parser. The
-hydrated graph is used immediately for indicators and graph metrics.
+Mindmap action remain the only operations that run the line-based parser.
+
+Metadata is the single source of truth for the parsed structure. Hydration
+runs on startup, after every parse or metadata change, and after every
+debounced scene change; the resulting node list (IDs, parent IDs, shapes) feeds
+the indicators and the graph feeds the metrics. The runtime never keeps
+`LogicalElement` snapshots across scene changes (the earlier `parsedNodes`
+snapshot froze bounds at parse time, so indicators and metrics did not follow
+moved content). A node whose content was deleted is skipped, which also drops
+its subtree from the graph until the content is restored (for example with
+undo) or the map is parsed again; the parent's `mindmapChildren` metadata is
+left untouched for that reason.
 
 ### 7.1 Core interaction contract
 
@@ -390,36 +566,72 @@ research test graphs.
 
 ## 9. Temporary Indicators and Scene Transactions
 
-Indicators use the same coordinates as the current scene, are moved to the
-topmost scene z-index after each refresh, and are clearly distinguishable from
-user content: red dashed padded Border, blue dashed Root, and green per-node
-indicators/arrows. They must carry `isMindmapTemporary: true` in
-`customData`. Their IDs are held in runtime state, not persisted in root/node
-metadata.
+Indicators use the same coordinates as the current scene, are created on top
+of the scene (`newElementsOnTop`), and are clearly distinguishable from user
+content: red dashed padded Border, blue dashed Root, and green per-node
+indicators/arrows. Their `customData` is:
 
-Indicator refreshes reconcile stable keys for the border, root, each node, and
-each parent arrow. A geometry/shape signature determines whether an existing
-temporary element can be retained; only changed, removed, or newly required
-indicators participate in the one coherent unsaved EA transaction
-(`addElementsToView(false, false)`). Unknown temporary elements are cleaned up
-when encountered. An unchanged refresh performs no EA scene transaction. The
-initial main-modal open refreshes configured border and root indicators before
-the user opens any child settings modal. Closing the main modal deletes all temporary
-elements, including indicators created by an open child modal. Closing or
-cancelling Border Settings restores the last committed preview state.
+```ts
+{
+  isMindmapTemporary: true,
+  mindmapIndicatorKind: "border" | "root" | "node" | "arrow",
+  mindmapIndicatorOwner: string  // anchor ID of the represented content
+}
+```
+
+Their IDs are held in runtime state (`IndicatorState.records`), not in
+root/node metadata. Each record stores its key (`border`, `root`,
+`node:<id>`, `arrow:<childId>`), element ID, kind, owner, element type, the
+geometry the indicator was last placed at, and the owner's bounds at that time.
+
+### 9.1 Indicator sync
+
+`syncIndicators(ea, state, model)` is the only way indicators change. The model
+holds border ID, padding, root ID, and the hydrated node list; everything else
+is resolved from the live scene on every call. One sync:
+
+1. **Indicator drags.** For each border/root/node record whose owner still has
+   the recorded bounds while the indicator element moved (and was not
+   resized), the owner's logical elements (group members and bound text) are
+   moved by the same offset in one undoable transaction, followed by
+   `api.refreshAllArrows()` for bound connectors. Moving an indicator thus moves
+   its content.
+2. **Reconcile.** Desired indicators are derived from the current content:
+   - moved content: its indicator and the parent/child arrows follow;
+   - content and indicator moved together (box selection): nothing to do;
+   - resized or dragged arrow indicators: snapped back;
+   - deleted content: its indicator and arrows are deleted;
+   - deleted indicator: recreated;
+   - unknown temporary elements (for example a crashed or file-switched
+     session's leftovers that autosave persisted): deleted.
+
+   Indicators with an unchanged type are updated in place (`x`, `y`, `width`,
+   `height`, arrow `points`), so IDs and the user's selection survive; only a
+   type change (ellipse/rectangle) recreates one. All changes form one unsaved
+   transaction with `captureUpdate: "NEVER"`; an unchanged sync performs no
+   transaction.
+
+The session calls a refresh (hydrate, sync, re-hydrate if content moved) after
+every debounced scene change, after every metadata action, and on startup.
+Border Settings temporarily replaces the model's border/padding with its
+uncommitted candidate; closing or cancelling it restores the committed state.
 
 Persistent metadata changes from the UI use
-`await ea.addElementsToView(false, false)`. Before the first mutation of a
-layout run, the current drawing is explicitly saved as part of backup
-preparation; that is the sole save-enabled scene transaction. A failed
-transaction must leave runtime state consistent and must not leave the EA
-workbench dirty.
+`addElementsToView(false, false, false, false, "NEVER")` with freshly copied
+elements. Before the first mutation of a layout run, the current drawing is
+explicitly saved as part of backup preparation; that is the sole explicitly
+save-enabled scene transaction. A failed transaction must leave runtime state
+consistent and must not leave the EA workbench dirty (`ea.clear()` in
+`finally`).
 
 ## 10. Backups and Rollback
 
-Before the first mutation of a layout run, save the complete current drawing
-file through the Obsidian vault API in a hidden folder named `mindmap-backup`
-beside the current mindmap file. The backup name is:
+Before the first mutation of a layout run, remove the indicators, save the
+drawing, and copy the complete saved file through the Obsidian vault API into a
+folder named `mindmap-backup` beside the current mindmap file. The folder is a
+normal vault folder (a dot-folder would not be indexed by the vault API); the
+`.backup` files are hidden from the file explorer only because Obsidian does not
+show unknown extensions by default. The backup name is:
 
 ```text
 <current-file-name>.run<incrementing-number>.backup
@@ -429,31 +641,70 @@ The counter is the next available number for this current file in that folder;
 it must be collision-safe. Backups contain the whole original file, not only
 the selected elements. Never overwrite an existing backup.
 
-Rollback selects the newest matching backup only after explicit confirmation,
-restores it to the active file using the vault API, updates the mounted
-Excalidraw scene through the public imperative API, and then deletes the
-consumed backup. Handle missing files and write failures without deleting the
-only recoverable backup. Clear backups matches the current file exactly and
-leaves backups belonging to other drawings untouched.
+Rollback selects the newest matching backup only after explicit confirmation
+and restores it in this order (`backup.ts: rollbackLatestMindmapBackup`):
 
-The current vault path is `ea.targetView.file.path`; the implementation uses
-`ea.plugin.app.vault` and the active file object rather than target-view
-internals. `Vault.modify(activeFile, restoredContent)` restores the persisted file, but an
-already-mounted Excalidraw editor may retain its in-memory scene. The rollback
-callback therefore parses the restored document and calls the public
-imperative API's `updateScene` before consuming the backup. No undocumented
-view reload shortcut is used. The import-safe `backup.ts` helper implements
-collision-safe creation, exact per-file matching, newest-backup rollback, and
-cleanup of the empty `mindmap-backup` folder. The layout runner still needs to
-call `createMindmapBackup` immediately before its first save-enabled mutation.
+1. Wait for queued transactions, then read the backup. A read failure changes
+   nothing.
+2. End the workbench session (indicators removed, hook server released).
+3. Close every leaf that shows the drawing (`closeViewsOfFile`:
+   `leaf.setViewState({ type: "empty" })`, which awaits the view's final save
+   and the destruction of the script EA).
+4. Write the backup content with `Vault.modify`. No editor is open, so the
+   plugin's merge (section 3.2.5) cannot interfere.
+5. Reopen the drawing in the original leaf with `leaf.openFile`. The plugin
+   loads the restored file from disk with full fidelity (elements, deletions,
+   text, embedded files).
+6. Delete the consumed backup and the then-empty `mindmap-backup` folder.
+
+If any step before 6 fails, the backup is kept and an error is logged and
+shown. Clear Backups matches the current file exactly and leaves backups
+belonging to other drawings untouched.
+
+The earlier approach (write the file while the view is open, then
+`leaf.openFile` on the same file) could not work: `openFile` for the file
+already loaded in the leaf is a no-op (`FileView.loadFile` returns early), and
+the write was merged into the live scene instead of replacing it (section
+3.2.5). Restoring into the live view with `updateScene` was rejected as well:
+it would also need the plugin's text-element, link, and embedded-file state to
+be rebuilt, which only a full load does.
+
+The import-safe `backup.ts` helper implements collision-safe creation, exact
+per-file matching, the rollback order above, and cleanup of the empty
+`mindmap-backup` folder. The layout runner still needs to call
+`createMindmapBackup` immediately before its first layout mutation.
 
 ## 11. Lifecycle and Failure Behavior
 
 - Verify the required Excalidraw plugin version before opening the modal.
-- If the Excalidraw API or active target view is unavailable, stop cleanly with
-  the existing notice pattern.
-- Closing the modal cancels a running loop, removes listeners/timers, clears all
-  temporary elements, and leaves the last committed persistent state intact.
+- If the Excalidraw API, the active target view, or its file is unavailable,
+  stop cleanly with the existing notice pattern.
+- One `WorkbenchSession` per view (`session.ts`). Starting the script again on
+  the same view ends the previous session (`replaced`) first, so two sessions
+  never compete for the hook server.
+- On start the session calls `ea.registerThisAsViewEA()` and sets
+  `ea.onViewUnloadHook`, subscribes to `api.onChange`, `api.onPointerDown`,
+  `api.onPointerUp`, and the workspace `file-open` event, and registers its
+  teardown with `ea.registerCleanup`.
+- Teardown is idempotent and synchronous. It stops timers, unsubscribes all
+  listeners, removes every temporary element through the captured imperative
+  API, releases the hook server, closes the main modal and all child modals,
+  and leaves the last committed persistent state intact. Every async
+  continuation checks `session.alive`, and queued transactions are skipped
+  after teardown. Teardown reasons:
+
+  | Reason | Trigger | Indicators |
+  | --- | --- | --- |
+  | `modal-close` | user closes the main modal | removed (view alive) |
+  | `view-unload` | `onViewUnloadHook`, before the final save | removed via captured API |
+  | `ea-destroy` | `registerCleanup`, after the final save | removed if still mounted |
+  | `file-switch` | other file opened in the same leaf | not touched (other drawing) |
+  | `rollback` | before the drawing is closed and restored | removed |
+  | `replaced` | script started again on the same view | removed |
+
+- Closing the modal cancels a running loop (future), removes listeners/timers,
+  clears all temporary elements, and leaves the last committed persistent state
+  intact.
 - Parsing with no root, no border, or no matching lines is valid; show an empty
   or explanatory state without throwing.
 - Malformed metadata is ignored or replaced with validated defaults, although a
@@ -473,9 +724,12 @@ call `createMindmapBackup` immediately before its first save-enabled mutation.
 6. Add vault backup, rollback confirmation, restore/reload, and cleanup. The
   vault helper and UI rollback/cleanup controls are implemented; the future
   layout runner must call backup creation before its first save-enabled edit.
-7. Add focused tests for pure metadata, geometry, queue/loop handling, and
-   algorithm mapping; then run the repository check/build and an Obsidian smoke
-   test covering modal lifecycle, popout/mobile behavior, selection, parsing,
+7. Add focused tests for pure metadata, geometry, queue/loop handling,
+   indicator sync, and algorithm mapping (the repository has no Vitest setup
+   yet; `syncIndicators` was verified with a throwaway fake-EA smoke script);
+   then run the repository check/build and an Obsidian smoke test covering
+   modal lifecycle, closing the drawing with the workbench open, popout/mobile
+   behavior, selection through indicators, indicator/content moves, parsing,
    save, rollback, and cancellation.
 
 ## 13. Acceptance Criteria for the First UI Slice
@@ -492,6 +746,15 @@ call `createMindmapBackup` immediately before its first save-enabled mutation.
   and shown with green node and parent-arrow indicators on startup.
 - Closing the primary modal removes every temporary element marked with
   `isMindmapTemporary`.
+- Closing the drawing (tab close, window close) while the workbench is open
+  saves a file without temporary elements and logs no "targetView not set".
+- Selecting an indicator works like selecting its node for root selection,
+  border selection, and Apply Shape.
+- Moving content moves its indicator and arrows; moving an indicator moves its
+  content (undoable); deleting content removes its indicator; deleting an
+  indicator recreates it.
+- Rollback restores every element of the backup, including deleted nodes and
+  earlier positions, and the restored file is not overwritten afterwards.
 - The UI is implemented through documented EA/Obsidian APIs and does not
   mutate immutable scene elements directly.
 - Backup and rollback controls use the documented vault API and remain disabled
@@ -500,45 +763,53 @@ call `createMindmapBackup` immediately before its first save-enabled mutation.
 ## 14. First-slice implementation notes
 
 The current implementation includes import-safe metadata loading, persisted
-graph hydration with automatic metrics, group-aware logical selection, unsaved
-indicator/metadata transactions, startup indicator refresh, selection notices,
-debounced border and connection-distance previews, incremental indicator
-reconciliation, and compact modal styling with a clickable credit link. The Border Settings modal uses the
-documented default positioning; no CSS translation is applied. Border, Root,
-parsed-node, and parent-arrow indicators are reconciled in one transaction only
-when their geometry or shape changes; the border therefore remains visible for
-the full lifetime of the main modal, including while Border Settings is open.
-All temporary indicators continue to carry `isMindmapTemporary: true`, and all
-are removed when the main modal closes.
+graph hydration with automatic metrics, group- and bound-text-aware logical
+selection, indicator-to-owner selection mapping, a serialized transaction
+queue, unsaved non-undoable indicator/metadata transactions, two-way
+indicator/content movement sync, startup indicator refresh, selection notices,
+debounced border and connection-distance previews, and compact modal styling
+with a clickable credit link. The Border Settings modal uses the documented
+default positioning; no CSS translation is applied. The border indicator stays
+visible for the full lifetime of the main modal, including while Border
+Settings is open.
+
+Module responsibilities:
+
+- `session.ts`: `WorkbenchSession` binds to one view, registers the hook
+  server and `onViewUnloadHook`, subscribes to scene/pointer/file-open events,
+  owns the transaction queue, and performs the idempotent teardown.
+- `indicators.ts`: indicator model, records, `syncIndicators` (drag detection,
+  in-place reconcile), `resolveIndicatorOwners`, `clearIndicatorsNow`.
+- `scene.ts`: `TransactionQueue`, `saveMetadata` (fresh copies), `moveElements`,
+  `saveCurrentDrawing`, `removeTemporaryElementsNow` (imperative API, usable
+  during view unload).
+- `ui.ts`: the `Workbench` runtime object (state, indicator registry, hydrated
+  nodes, border preview, child modals) and all UI actions.
 
 The startup loader keeps the first root flag in stable scene order. If more
 than one element is flagged as a root, the remaining root flags are removed in
 one unsaved metadata transaction and a warning notice is shown. Selecting a new
-root removes the previous root flags in the same transaction. The main modal
-is rendered from current runtime state after each configuration or parse
-change, so labels, graph counts, and indicator state do not remain stale.
-Metadata actions are displayed in one row; Start, Step, and Reset share a row,
-as do Rollback and Clear Backups.
+root removes the previous root flags in the same transaction. Metadata actions
+are displayed in one row; Start, Step, and Reset share a row, as do Rollback and
+Clear Backups.
 
 The first parser slice is implemented in the import-safe `parser.ts` module.
 It filters temporary and line elements, excludes the configured Border Element
-and every member of its group, walks a queue with a read pointer,
-uses ellipse-aware boundary distance checks, resolves the nearest eligible
-canvas element in stable scene order, rejects queued and cyclic candidates,
-and adds `TreeNode` instances parent-first to a `TreeGraph`. Parsed nodes
-retain their actual bounds and normalized shape. Parsing persists parent and
-children metadata, infers a missing shape, clears stale mindmap relationships,
-and creates green node indicators with small arrows toward each parent. The
-graph and indicator state are discarded and rebuilt when a new root is chosen
-or parsing is run again.
+and every member of its group, walks a queue with a read pointer, uses
+shape-aware boundary distance checks, resolves the nearest eligible canvas
+element in stable scene order, rejects queued and cyclic candidates, and adds
+`TreeNode` instances parent-first to a `TreeGraph`. Parsed nodes retain their
+actual bounds and normalized shape. Parsing persists parent and children
+metadata (children arrays are copied, not shared with the graph), infers a
+missing shape, and clears stale mindmap relationships; indicators then follow
+from hydration.
 
 Confirmed Clear Mindmap and Clear All Metadata actions are implemented through
-unsaved metadata transactions and preserve unrelated custom data. The
-import-safe `backup.ts` module implements complete-file backup creation,
-newest-backup rollback, and exact per-file cleanup. The current Start action
-clears temporary indicators, saves the current scene once, and then creates
-the backup; the future layout algorithm runner must retain that ordering before
-its first layout mutation.
+unsaved metadata transactions and preserve unrelated custom data. The current
+Start action clears temporary indicators, saves the current scene once (by
+round-tripping one element through `addElementsToView(..., save = true)`), and
+then creates the backup; the future layout algorithm runner must retain that
+ordering before its first layout mutation.
 
 ## 15. Correctness Notes and Key Changes
 
@@ -566,16 +837,53 @@ helpers; future algorithm position updates must convert graph positions back
 through `graphToScenePoint` before editing Excalidraw elements. Indicators remain
 scene overlays and therefore use the original logical element bounds directly.
 
-Temporary indicators are cleared before backup creation and on every modal or
-EA cleanup path. Indicator cleanup removes all elements marked
-`isMindmapTemporary` directly through `ea.deleteViewElements`, so it is
-synchronous and does not race EA target-view destruction. The workbench
-installs `ea.onViewUnloadHook`, which runs before the Excalidraw target view is
-invalidated, closes the modal, and performs that synchronous removal while EA
-still has a valid target. Rollback restores the complete file through Obsidian and reopens it through the
-originating `WorkspaceLeaf`, allowing Excalidraw to parse both raw JSON and its
-compressed Markdown drawing format. The backup is consumed only after that
-reopen succeeds. All caught failures are also written with `console.error`
-before the user notice is shown. Clearing the final backup deletes the empty
-`mindmap-backup` folder itself while preserving folders that still contain any
-files.
+Temporary indicators are cleared before backup creation and on every teardown
+path. The earlier close handling did not work for three independent reasons
+(section 3.2): the hook was set on the script EA without
+`registerThisAsViewEA()`, so the view never called it; the `registerCleanup`
+fallback runs only after the final save; and `ea.deleteViewElements` refuses to
+run once `targetView._loaded` is false, which produced the "targetView not set"
+console error. Calling the previous hook unconditionally also threw, because
+its default value is `null`. The session now registers as hook server and
+removes indicators in the hook through the imperative API captured at startup,
+which is synchronous and still mounted at that point.
+
+Rollback closes all views of the file, writes the backup, and reopens the file
+(section 10). The backup is consumed only after the reopen succeeds. All caught
+failures are also written with `console.error` before the user notice is shown.
+Clearing the final backup deletes the empty `mindmap-backup` folder itself
+while preserving folders that still contain any files.
+
+## 16. Known Limitations and Open Issues
+
+- **Switching files in the same tab** with the workbench open: Obsidian calls
+  `onUnloadFile` (which saves) without unloading the view, and no hook runs
+  before that save. Indicators are therefore persisted in the previous drawing;
+  the workbench closes on the following `file-open` event, and the next session
+  on that drawing deletes the leftovers. Autosave and crashes can leave
+  leftovers the same way.
+- **Hook shadowing**: while a session is active, the script EA is the view's
+  hook server, so hooks set on `window.ExcalidrawAutomate` (startup script) are
+  not called for that view. Only the previous `onViewUnloadHook` of the script
+  EA itself is chained.
+- **Undocumented reset**: releasing the hook server uses the view's
+  `setHookServer()` because `deregisterThisAsViewEA()` is broken in 2.27.x.
+  Recheck after plugin upgrades and switch back to the public method when fixed.
+- **Nested groups**: `getElementsInTheSameGroupWithElement` matches any shared
+  group ID and `getMaximumGroups` uses the outermost group. If the whole map is
+  grouped, every node resolves to the entire map. Nodes must currently be
+  ungrouped or grouped only with their own parts.
+- **Bound connectors**: moving content through its indicator moves elements by
+  offset and then calls `api.refreshAllArrows()`. Unbound lines (as used by the
+  parser's endpoint matching) are not moved; this is the layout runner's
+  concern as well.
+- **Defaults**: `DEFAULT_PADDING` (90/100/110/100) differs from the
+  malformed-value fallback (`0`), and the connection-distance default (`15`)
+  differs from its malformed-value fallback (`50`). Decide on one value per
+  setting.
+- **Duplicate border flags** are not repaired (roots are).
+- **Rollback ends the workbench**, because the view and its script EA are
+  destroyed. Re-opening it automatically would need a new EA for the reopened
+  view (`window.ExcalidrawAutomate.getAPI(view)`), which the Script Engine would
+  not destroy on close; the session's own hook-based teardown would have to be
+  the only cleanup path.
