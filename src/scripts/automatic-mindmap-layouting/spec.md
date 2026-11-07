@@ -3,8 +3,9 @@
 ## Status
 
 Draft specification for the ExcalidrawAutomate script. This document describes
-the first implementation slice (the floating UI) and the contracts that later
-graph parsing, layout, persistence, and evaluation code must satisfy.
+the implemented workbench (floating UI, parsing, indicators, backups, and the
+integrated nikogenia v1 layout algorithm) and the contracts that further
+algorithms, persistence, and evaluation code must satisfy.
 
 ## 1. Goal and Scope
 
@@ -38,18 +39,23 @@ src/scripts/automatic-mindmap-layouting/
   parser.ts                       Line parser and metadata hydration
   edges.ts                        Line <-> anchored edge geometry
   layout.ts                       Writes a graph back to the canvas
+  algorithm.ts                    Algorithm options, parameter table, Start/Reset setup
+  runner.ts                       Time-sliced layout run (start, stop, continue, step)
+  textfit.ts                      Fit Selected Text Widths helper
+  dom.ts                          DOM builders for the modals
   backup.ts                       Vault backups and rollback
   preview.svg                     Script preview asset
   README.md                       Script-facing documentation
   spec.md                         This implementation specification
   core/                            Symbolic link to the research engine
-    graph/types.ts                TreeNode, TreeEdge, TreeGraph
+    graph/types.ts                TreeNode (incl. fixed), TreeEdge, TreeGraph
     graph/TreeEdgeGraph.ts        TreeGraph subclass with movable edge anchors
     graph/shapes.ts               Shape geometry (ray casting, anchor clamping)
     graph/evaluation.ts           Graph metrics and formatted metrics string
     graph/evaluationEdge.ts       Metrics measured on anchored edges
     graph/generators.ts            Reproducible test graphs
     algorithms/types.ts           LayoutAlgorithm contract
+    algorithms/nikogenia/         NikogeniaAlgorithmV1 and RadialAlgorithmArea (used)
     algorithms/...                 Random, radial, Eades, Fruchterman-Reingold,
                                    Harel-Koren, and Tunkelang implementations
 ```
@@ -85,7 +91,9 @@ imported by automated tests.
 - Undo capture: workbench-owned changes (indicators, metadata) use
   `captureUpdate: "NEVER"` so Ctrl+Z neither resurrects indicators nor silently
   removes root/border flags behind the runtime state. Content moves caused by
-  dragging an indicator use `"IMMEDIATELY"` and are undoable like a native move.
+  dragging an indicator and Fit Selected Text Widths use `"IMMEDIATELY"` and are
+  undoable like a native edit. Layout writes (Start, Step, Reset) use `"NEVER"`;
+  their undo is Rollback.
 - Merge metadata with `ea.addAppendUpdateCustomData(id, patch)` so plugin or
   user metadata is preserved. A patch value of `undefined` removes the key.
 - Temporary indicators are scene elements only while the main modal is open.
@@ -274,12 +282,28 @@ other border flags with a warning (as is done for roots) is not implemented yet.
   isMindmapRoot: true,
   mindmapShape: "ellipse" | "rectangle",
   mindmapConnectionDistance: number,
-  mindmapChildren: string[]
+  mindmapChildren: string[],
+  mindmapAlgorithmSettings?: {      // stored mindmap parameters (section 5.2)
+    algorithm: "nikogenia1",
+    stepsPerRender: number,         // 1..1000, 1001 = Finished
+    parameters: Record<string, number | boolean>
+  }
 }
 ```
 
 `mindmapConnectionDistance` is an integer in `[1, 300]`. The default is `15`,
 also for a malformed persisted value.
+
+`mindmapAlgorithmSettings` holds the mindmap parameters saved with **Save
+Mindmap Parameters**: the algorithm, Steps Per Render, and every parameter of
+the parameter table (primary, advanced, and Reset parameters). Reset Before
+Start and the open state of Advanced Parameters are workbench state and are not
+stored. `algorithm.ts: readStoredSettings` validates the value: an unknown
+algorithm, missing or malformed values fall back to the defaults, numbers are
+clamped to the parameter ranges and rounded to the step, and unknown keys are
+ignored. Selecting another root moves the stored parameters to it unless the new
+root already has its own. Clear All Metadata removes them; Clear Mindmap keeps
+them.
 `mindmapShape` is the normalized `TreeNode.shape` value. The UI may label the
 rectangle option `rect`, but graph data must use `rectangle`, matching the core
 types and evaluation functions.
@@ -328,6 +352,23 @@ deleting the line removes the binding, and undo restores it. Node elements store
 no line IDs. `readEdgeMetadata` validates the value; malformed metadata counts as
 no binding.
 
+### Fixed elements
+
+```ts
+{
+  isMindmapFixed: true
+}
+```
+
+Stored on the anchor of a logical element (element or group) that layout
+algorithms must not move (`TreeNode.fixed` in the core, for example a logo that
+reserves its corner). Other nodes are still repelled by it and must not overlap
+it. The element may be a parsed tree node (it keeps its parent and children) or
+any other element (it becomes an isolated node without parent edge). Lines,
+arrows, and the border cannot be fixed; a stale flag on them is ignored.
+`isFixedFlagged` reads the flag. Clear Mindmap keeps it, Clear All Metadata
+removes it.
+
 ## 5. Primary Floating Modal
 
 The main modal title is **Automatic Mindmap Layouting**. It is opened as soon
@@ -337,24 +378,32 @@ not mutate the scene.
 
 **Selections through indicators.** Indicators lie on top of their content, so
 a click usually selects the indicator. Every selection-driven action (Use
-Selected Element/Group, Select Root Element/Group, Apply Shape To Selection)
-first maps selected indicators to their owner via
+Selected Element/Group, Select Root Element/Group, Apply Shape To Selection,
+Fix/Unfix Selection, Fit Selected Text Widths) first maps selected indicators
+to their owner via
 `customData.mindmapIndicatorOwner` (`resolveIndicatorOwners`) and folds bound
 text into its container. Selecting an indicator is therefore equivalent to
 selecting its node; selecting both the node and its indicator is not
 ambiguous.
 
 **Notices.** Each user action reports its result with an Obsidian notice: root
-saved, border saved, parse result (node and edge counts), shape applied, metadata
-cleared, backup created, backup restored, backups cleared, and every failed
-precondition or error. Restarting the script while a workbench is open, or
+saved, border saved, parse result (node and edge counts), shape applied, elements
+fixed or unfixed, text widths fitted (narrowed / already minimal / skipped),
+metadata cleared, backup created (file name), layout run started, continued,
+stopped (with the step), or completed, initial layout applied, mindmap
+parameters saved or restored, algorithm defaults restored, backup restored
+(file name), backups deleted (count), and every failed precondition or error. Restarting the script while a workbench is open, or
 opening another file in its tab, also shows a notice. Continuous input (sliders)
 and automatic refreshes stay silent.
 
 The modal is rendered from runtime state. A scene change re-renders it only
-when border/root/graph presence changed (for example the root was deleted or
-restored with undo); otherwise only the graph statistics text is updated, so
-sliders are not rebuilt while the user drags them.
+when border/root/graph presence or the number of fixed elements changed (for
+example the root was deleted or restored with undo); otherwise only the graph
+statistics text is updated, so sliders are not rebuilt while the user drags
+them. While Start, Step, or Reset owns the scene (`busy`, section 7.3), every
+control of Mindmap Data, Step, Reset, Rollback, and Clear Backups is disabled;
+the algorithm controls stay enabled and apply to the next run (Steps Per Render
+applies immediately).
 
 ### 5.1 Mindmap Data
 
@@ -399,6 +448,29 @@ sliders are not rebuilt while the user drags them.
   action resolves the selection (content or indicators) to logical anchors and
   updates those already marked `isMindmapNode` (the root included), both in
   metadata and in their temporary indicators.
+- Show **Fixed Nodes: N** with **Fix Selection** and **Unfix Selection**. Both
+  resolve every selected element (content or indicator) to its logical element,
+  so several elements and groups can be fixed at once. Fix writes
+  `isMindmapFixed` on the anchors; Unfix removes the flag from every member of
+  the selected logical elements. The border and lines are rejected with a notice.
+  Fixed elements get an orange indicator (section 9) and are loaded into the
+  graph (section 7). No root, border, or parse is needed to fix an element.
+- Provide **Fit Selected Text Widths**: every selected free-standing text element
+  (not container-bound text, whose width follows its container) is narrowed to
+  the minimum width that keeps its line breaks, in one undoable transaction:
+  - Excalidraw re-wraps `originalText` at the element width whenever a
+    fixed-width text (`autoResize: false`) is edited or refreshed. The lower
+    bound is the widest current line (`ExcalidrawLib.measureText` with the
+    element's font string and line height). Greedy wrapping at any width between
+    that line and the old width yields the same lines, so the measured width
+    normally fits immediately.
+  - Each candidate width (rounded up, then up to 4 px more) is verified with
+    Excalidraw's own `ExcalidrawLib.wrapText(originalText, font, width) ===
+    text`. A text whose lines cannot be reproduced (for example an old manual
+    wrap inside a word) is skipped and keeps its width.
+  - Centered and right-aligned text is shifted by half or all of the removed
+    width, so the lines stay where they are. Auto-resizing text is already
+    minimal and stays unchanged.
 - Show Graph Statistics after parsing or successful startup graph loading, using
   `calculateTreeEdgeGraphMetricsString(graph)`. Statistics follow moved and deleted
   content (the graph is re-hydrated after every scene change).
@@ -422,32 +494,84 @@ sliders are not rebuilt while the user drags them.
 
 ### 5.2 Algorithm
 
-- Provide an algorithm dropdown. The first implementation exposes **Default**;
-  the adapter must be designed for the concrete core algorithms later.
-- Provide a **Steps Per Render** input with slider and number field constrained to
-  `1..1000`, default `1`.
-- Reserve a clearly labeled options area for algorithm-specific controls.
+- An algorithm dropdown with the single option **Default (nikogenia v1)**
+  (`ALGORITHM_OPTIONS` in `algorithm.ts`, value `nikogenia1`). More algorithms
+  are added there.
+- **Steps Per Render**: slider and number field, `1..1000`, default `50`. The
+  slider's last position means **Finished**: the run renders only once, when it
+  completes (or is stopped); the number field is then empty and shows
+  `Finished` as placeholder. A changed value applies to a running run at its next
+  slice.
+- Always visible below: **Gap Constant** and **Max Anchor Offset Ratio**.
+- Collapsed **Advanced Parameters** (`<details>`, open state kept across
+  re-renders): every other public parameter of `NikogeniaAlgorithmV1` with the
+  ranges of the research web UI (`Nikogenia1Sim.ts`), the two Reset parameters of
+  `RadialAlgorithmArea` (level gap, area exponent).
+  Defaults are read from fresh core instances, so they follow core changes.
+  Not exposed: `borderPadding` (always `1`, section 7.1) and `keepInitialLayout`
+  (decided by Start/Reset, section 7.3).
+- The initiation mode is not selectable: Reset always uses the radial area
+  weighted layout, Start always uses none (the current layout).
+- Below the parameters, always visible:
+  - **Restore Algorithm Defaults** sets algorithm, Steps Per Render, and all
+    parameters to the core defaults (not to the stored mindmap parameters).
+  - **Restore Mindmap Parameters** loads the parameters stored on the root
+    (`mindmapAlgorithmSettings`, section 4). Enabled only when parameters are
+    stored and differ from the current settings.
+  - **Save Mindmap Parameters** stores the current settings on the root. Enabled
+    only when a root exists and the current settings differ from the stored ones
+    (or nothing is stored). It writes only the root's metadata (`"NEVER"`, not
+    saved), so a stopped run stays resumable.
+- On startup the workbench uses the stored mindmap parameters when the root has
+  them, otherwise the core defaults. Changes are workbench-only until saved.
+  Changing an algorithm parameter (also by a restore) discards a stopped run, so
+  the next Start uses the new values; Steps Per Render does not.
+- Both buttons and the Start label (section 5.3) update on every setting change
+  and after every refresh without rebuilding the modal (`ui.ts: updateControls`).
+  The stored parameters are re-read from the root on every hydration, so undo
+  and redo of a save are reflected.
 
 ### 5.3 Control
 
-Provide **Start**, **Step**, **Reset**, **Rollback**, and **Clear Backups**.
+**Start**, **Step**, **Reset** in the first row, **Rollback** and **Clear
+Backups** in the second, a **Reset Before Start** checkbox below, then the run
+statistics. Semantics in detail: section 7.3.
 
-- **Start** runs the selected algorithm until completion or cancellation,
-  rendering after the configured number of algorithm steps.
-- **Step** performs one algorithm step and renders the result. This button is
-  disabled if the algorithm wasn't started or reseted yet and isn't completed or running.
-- **Reset** initializes execution from the parsed graph and resets run metrics;
-  it does not discard user configuration.
-- **Rollback** asks for confirmation in an Obsidian modal, restores the newest
-  backup for the current file (closing and reopening the drawing, section 10),
-  then removes that backup. The workbench ends with the closed view; the user
-  starts the script again on the reopened drawing.
-- **Clear Backups** removes all backups for the current file. If the backup
-  folder is empty afterward, remove the folder as well.
+- **Start** runs nikogenia v1 directly on the current layout (initiation mode
+  `none`) until it completes or is stopped, rendering after every Steps Per
+  Render steps. While it runs, the button is **Stop** (like the research web
+  UI). After Stop, it is **Resume** as long as the stopped run can be continued
+  (section 7.3: not completed, drawing unchanged, parameters unchanged, Reset
+  Before Start unchecked). As soon as anything changes that would make Start
+  begin a new run, the label returns to **Start**.
+- **Step** performs one algorithm step of the stopped run, or of a new run on the
+  current layout, and renders it.
+- **Reset** applies the initial layout (radial area weighted, rotated and fitted
+  to the border area) and discards a stopped run.
+- **Reset Before Start**: when checked, every Start first applies Reset and then
+  runs on the new initial layout (one backup for both).
+- Start, Step, and Reset create a backup before they change anything (section
+  10). They are disabled without a parsed graph with at least one non-root node.
+- **Rollback** opens the rollback dialog (section 10): it shows the newest
+  backup's file name and creation date and time, and offers **Restore**,
+  **Choose Previous Backup** (enabled when an older backup exists), and
+  **Cancel**. The workbench ends with the closed view; the user starts the
+  script again on the reopened drawing.
+- **Clear Backups** asks `Delete all N backups of this drawing?` and removes them.
+  If the backup folder is empty afterward, the folder is removed as well.
 
-Show current-run metrics: current step / total steps, and milliseconds per
-step for now, minimum, average, and maximum. Disable controls when their
-preconditions are not met (for example, no parsed graph or no active run).
+Run statistics replace the earlier placeholders and update after every render:
+
+```text
+Current Step / Total Steps: 120 / 600 (layout | legalization)
+Milliseconds Per Step: Now 1.2 | Min 0.8 | Average 1.1 | Max 3.4
+Status: Running | Gap 31.4 | Step Length 2.10 | Max Move 0.85 | Anchor Repairs 3
+```
+
+The status is `Idle`, `Preparing...`, `Running`, `Stopped at step i / n`,
+`Paused at step i / n` (after Step), `Completed`, `Initial layout applied`, or
+`Failed`. The Graph Statistics of section 5.1 show the run's live graph while it
+runs.
 
 The modal content uses the current view's document, a compact `0.9em` base
 font, flex column layout, consistent gaps and margins, and a smaller credit
@@ -526,6 +650,15 @@ its subtree from the graph until the content is restored (for example with
 undo) or the map is parsed again; the parent's `mindmapChildren` metadata is
 left untouched for that reason.
 
+Fixed elements are loaded after the tree (`parser.ts: resolveFixedElements`,
+`addFixedNodes`): a flagged tree node gets `fixed: true` (`graph.setFixed`), any
+other flagged logical element is added as an isolated `TreeNode` with
+`fixed: true`, no `parentId`, and therefore no edge, using the same center,
+shape (`shapeOf`), and size rules as parsed nodes. Members of the border and
+lines are skipped. `ParsedMindmap.fixedIds` lists them for the indicators;
+without root and border, hydration still resolves them for the indicators.
+Isolated fixed nodes count in the graph statistics (node count, overlaps).
+
 ### 7.1 Core interaction contract
 
 The core is a mutable graph model. The parser must add nodes in parent-first
@@ -584,7 +717,8 @@ after the step that reaches completion, matching the current
 `LayoutAlgorithm` documentation. Callers should still check
 `isCompleted()` before starting another step. `dt` is supplied by the caller;
 the p5 example passes `p.deltaTime`, but our algorithms currently
-does not use it. An adapter must not invent time scaling, the parameter can be omitted.
+does not use it. An adapter must not invent time scaling, the parameter can be omitted
+(`NikogeniaAlgorithmV1.step()` declares no parameter at all).
 
 The UI's steps-per-render value is only an outer loop around `step(dt)`. It
 must not change the algorithm's iteration count or other algorithm semantics.
@@ -601,9 +735,11 @@ calling `initialize`. Do not assume that `initialize` resets parameters,
 positions, or progress unless the selected implementation documents that
 behavior.
 
-The default algorithm is intentionally a placeholder until the algorithm
-selection policy is reviewed. The implementation must not claim that one
-algorithm is universally best.
+The default algorithm is `NikogeniaAlgorithmV1` ("Default (nikogenia v1)").
+`algorithm.ts` creates a fresh instance for every run and copies all workbench
+parameters onto it before `initialize`, so no run state leaks between runs. It
+must not be presented as universally best; other core algorithms can be added to
+`ALGORITHM_OPTIONS`.
 
 ### 7.2 TreeEdgeGraph and edge lines
 
@@ -660,9 +796,81 @@ Undo capture defaults to `"NEVER"`, because Rollback is the undo of a layout run
 Lines grouped with a node are placed by the edge logic, not moved with the group.
 
 The layout runner calls `writeGraphToScene` after each render inside
-`session.run(...)`. It must keep its own `ParsedMindmap` and skip `hydrate` during
-a run, because hydration creates a new graph after every scene change, and that
-includes the runner's own writes.
+`session.run(...)`. It keeps its own `ParsedMindmap` and `refresh`/`hydrate` are
+skipped during a run (section 7.3), because hydration creates a new graph after
+every scene change, and that includes the runner's own writes. Fixed nodes keep
+their positions, so their elements are not touched.
+
+### 7.3 Layout runs
+
+**Graph of a run.** Start, Step, and Reset load a new `ParsedMindmap` from
+metadata and the live scene (`loadMindmapFromMetadata`), with positions, edge
+offsets from the line metadata, and fixed nodes. The run owns it until it ends.
+
+**Start (initiation mode `none`).** `createLayoutAlgorithm` sets
+`keepInitialLayout = true`: no rotation search and no canvas fit, the current
+drawing is optimized as it is, like the research web UI with initiation mode
+`none`. `borderPadding` is `1`. `initialize` re-projects the stored anchor
+offsets for the configured Max Anchor Offset Ratio.
+
+**Reset (initiation mode `radial-area`).** `applyInitialLayout` centers all
+anchors (`resetOffsets`), runs `RadialAlgorithmArea` (root at the canvas center,
+wedges proportional to subtree area, random start angle, fixed nodes restored to
+their positions), then initializes a throwaway `NikogeniaAlgorithmV1` with
+`keepInitialLayout = false`. Its structure preserving start rotates and fits the
+radial layout to the border area (Fit To Canvas, Initial Rotations); fixed nodes
+are excluded from both. No layout step runs. This is exactly what the web UI does
+before its first Nikogenia step, so Reset followed by Start equals one web UI run
+with initiation mode `radial-area`. The result is written once.
+
+**Reset Before Start** runs the Reset computation on the run's graph right before
+`createLayoutAlgorithm`, without writing the intermediate layout and with one
+backup. Step never resets.
+
+**Continuing.** Stop keeps the run (`wb.run`). The next Start or Step continues
+it if it is not completed and the drawing's content version
+(`runner.ts: contentVersion`, element count plus version sum without temporary
+elements) equals the version recorded after the run's last write. Any edit,
+metadata change, or parse in between starts a new run (with a new backup). A
+changed algorithm parameter discards the stopped run; Reset discards it too.
+
+**Execution model.** The run executes cooperatively on the main thread
+(`LayoutRun.run`): steps run for at most 12 ms or until Steps Per Render is
+reached, then control returns to Obsidian through a `MessageChannel` message
+(not clamped like nested `setTimeout(0)`, and the browser can paint and handle
+input before it is delivered). After every Steps Per Render steps, and once at
+the end, the graph is written with `writeGraphToScene` (`"NEVER"`, not saved; the
+drawing becomes dirty and autosave persists it). Steps per render is re-read
+every slice. User Timing marks that `NikogeniaAlgorithmV1.step` records per step
+are cleared after the run.
+
+A Web Worker was considered and rejected for now:
+
+- The script ships as one Script Engine bundle, and the template-managed
+  `esbuild.config.mjs` has no way to emit and inline a second worker bundle.
+- A worker needs its own copy of the core including p5 (the bundle is about 7 MB
+  because of p5), and p5 v2 needs a DOM to install `p5.Vector` math (the
+  benchmark worker in the research repository works around this).
+- Every render still has to go through EA on the main thread.
+
+The steps themselves are short (milliseconds for mindmap sizes), so slicing keeps
+Obsidian responsive. A single step or the initial rotation search of a very large
+graph can still block for its own duration.
+
+**Stopping.** `LayoutRun.stop()` sets a flag that is checked before every step,
+after every slice, and before every render. Stop renders the last computed steps
+and keeps the run. Session teardown (closing the workbench, closing the drawing,
+switching files, restarting the script, rollback) calls `stop()` first, and every
+render returns `false` once the session is no longer alive (queued transactions
+are skipped), so the loop ends within one step. Nothing survives the workbench:
+there is no worker or timer outside the loop.
+
+**Scene ownership.** While Start, Step, or Reset runs (`wb.busy`), indicators are
+removed (the backup removes them anyway), `refresh` is skipped, and conflicting
+controls are disabled (section 5). Afterwards the workbench re-hydrates from
+metadata and restores the indicators. Elements the user moves during a run are
+moved back to the algorithm's positions by the next render; deleted elements are
+skipped.
 
 ## 8. Evaluation and Best Layout
 
@@ -686,27 +894,36 @@ research test graphs.
 
 Indicators use the same coordinates as the current scene, are created on top
 of the scene (`newElementsOnTop`), and are clearly distinguishable from user
-content: red dashed padded Border, blue dashed Root, and green per-node
-indicators/arrows. Their `customData` is:
+content: red dashed padded Border, blue dashed Root, green per-node
+indicators/arrows, and orange (`#f08c00`) fixed elements. Their `customData` is:
 
 ```ts
 {
   isMindmapTemporary: true,
-  mindmapIndicatorKind: "border" | "root" | "node" | "arrow",
+  mindmapIndicatorKind: "border" | "root" | "node" | "fixed" | "arrow",
   mindmapIndicatorOwner: string  // anchor ID of the represented content
 }
 ```
 
+Root, node, and fixed indicators are drawn 2 px outside the owner's bounds on
+every side (`INDICATOR_OUTSET`), so they stay visible even where they would
+coincide with the outline of a node's own border element. The border indicator
+marks the padded layout area exactly and is not inflated. A fixed tree node
+shows the orange indicator instead of the green one (its parent arrow stays);
+a fixed root shows both, the orange ring 6 px outside so it encloses the blue
+one.
+
 Their IDs are held in runtime state (`IndicatorState.records`), not in
 root/node metadata. Each record stores its key (`border`, `root`,
-`node:<id>`, `arrow:<childId>`), element ID, kind, owner, element type, the
-geometry the indicator was last placed at, and the owner's bounds at that time.
+`node:<id>`, `fixed:<id>`, `arrow:<childId>`), element ID, kind, owner, element
+type, the geometry the indicator was last placed at, and the owner's bounds at
+that time. Dragging an orange indicator moves its content like any other.
 
 ### 9.1 Indicator sync
 
 `syncIndicators(ea, state, model)` is the only way indicators change. The model
-holds border ID, padding, root ID, and the hydrated node list; everything else
-is resolved from the live scene on every call. One sync:
+holds border ID, padding, root ID, the hydrated node list, and the fixed element
+IDs; everything else is resolved from the live scene on every call. One sync:
 
 1. **Indicator drags.** For each border/root/node record whose owner still has
    the recorded bounds while the indicator element moved (and was not
@@ -736,17 +953,20 @@ uncommitted candidate; closing or cancelling it restores the committed state.
 
 Persistent metadata changes from the UI use
 `addElementsToView(false, false, false, false, "NEVER")` with freshly copied
-elements. Before the first mutation of a layout run, the current drawing is
-explicitly saved as part of backup preparation; that is the sole explicitly
-save-enabled scene transaction. A failed transaction must leave runtime state
+elements. Before Start, Step (new run), and Reset change the layout, the current
+drawing is explicitly saved as part of backup preparation; that is the sole
+explicitly save-enabled scene transaction. A failed transaction must leave runtime state
 consistent and must not leave the EA workbench dirty (`ea.clear()` in
 `finally`).
 
 ## 10. Backups and Rollback
 
-Before the first mutation of a layout run, remove the indicators, save the
-drawing, and copy the complete saved file through the Obsidian vault API into a
-folder named `mindmap-backup` beside the current mindmap file. The folder is a
+Before any algorithm changes the layout (every Start that does not continue a
+stopped run, every Step that starts a new run, and every Reset; Reset Before
+Start creates one backup for both), remove the indicators, save the drawing, and
+copy the complete saved file through the Obsidian vault API into a folder named
+`mindmap-backup` beside the current mindmap file (`ui.ts: createRunBackup`). If
+the backup fails, the layout is not changed. The folder is a
 normal vault folder (a dot-folder would not be indexed by the vault API); the
 `.backup` files are hidden from the file explorer only because Obsidian does not
 show unknown extensions by default. The backup name is:
@@ -755,15 +975,30 @@ show unknown extensions by default. The backup name is:
 <current-file-name>.run<incrementing-number>.backup
 ```
 
-The counter is the next available number for this current file in that folder;
-it must be collision-safe. Backups contain the whole original file, not only
-the selected elements. Never overwrite an existing backup.
+The counter is the highest existing number for this file plus one, so the
+number order is the creation order even after an older backup was restored and
+consumed (reusing the first free number would sort a new backup before older
+ones). Creation is collision-safe (`Vault.create` fails instead of
+overwriting). Backups contain the whole original file, not only the selected
+elements. The creation time shown in the dialog is `TFile.stat.ctime`.
 
-Rollback selects the newest matching backup only after explicit confirmation
-and restores it in this order (`backup.ts: rollbackLatestMindmapBackup`):
+**Rollback dialog.** Shows the newest backup's file name and creation date and
+time with three buttons:
 
-1. Wait for queued transactions, then read the backup. A read failure changes
-   nothing.
+- **Restore** restores the newest backup.
+- **Choose Previous Backup** (only enabled when more than one backup exists)
+  switches the dialog to a dropdown of all older backups (`name (date time)`),
+  with **Restore**, **Back**, and **Cancel**.
+- **Cancel** closes the dialog.
+
+Only the restored backup is consumed; newer backups are kept, so a rollback
+to an older state can itself be undone by restoring a newer backup.
+
+Rollback restores the chosen backup in this order
+(`backup.ts: rollbackMindmapBackup`):
+
+1. Wait for queued transactions, check that the backup still exists, then read
+   it. A missing backup or a read failure changes nothing.
 2. End the workbench session (indicators removed, hook server released).
 3. Close every leaf that shows the drawing (`closeViewsOfFile`:
    `leaf.setViewState({ type: "empty" })`, which awaits the view's close and the
@@ -781,8 +1016,9 @@ and restores it in this order (`backup.ts: rollbackLatestMindmapBackup`):
 8. Delete the consumed backup and the then-empty `mindmap-backup` folder.
 
 If any step before 8 fails, the backup is kept and an error is logged and
-shown. Rollback takes about 1.5 s because of the two quiet periods. Clear Backups matches the current file exactly and leaves backups
-belonging to other drawings untouched.
+shown. Rollback takes about 1.5 s because of the two quiet periods. Clear Backups
+shows the number of backups it will delete, matches the current file exactly,
+and leaves backups belonging to other drawings untouched.
 
 Without step 4, the restored drawing is visible for a moment and is then replaced:
 the old view's write lands about 200 ms after the close, on top of the restored
@@ -799,8 +1035,7 @@ be rebuilt, which only a full load does.
 
 The import-safe `backup.ts` helper implements collision-safe creation, exact
 per-file matching, the rollback order above, and cleanup of the empty
-`mindmap-backup` folder. The layout runner still needs to call
-`createMindmapBackup` immediately before its first layout mutation.
+`mindmap-backup` folder.
 
 ## 11. Lifecycle and Failure Behavior
 
@@ -830,15 +1065,16 @@ per-file matching, the rollback order above, and cleanup of the empty
   | `rollback` | before the drawing is closed and restored | removed |
   | `replaced` | script started again on the same view | removed |
 
-- Closing the modal cancels a running loop (future), removes listeners/timers,
-  clears all temporary elements, and leaves the last committed persistent state
+- Every teardown stops a running layout run first (`LayoutRun.stop()`, section
+  7.3), then removes listeners/timers, clears all temporary elements, and leaves
+  the last committed persistent state (including the last rendered layout)
   intact.
 - Parsing with no root, no border, or no matching lines is valid; show an empty
   or explanatory state without throwing.
 - Malformed metadata is ignored or replaced with validated defaults, although a
   warning should be displayed; unrelated custom data is retained.
-- Long-running Start execution must yield to the UI and provide a cancellation
-  path through modal close.
+- Long-running Start execution yields to the UI every 12 ms and is cancelled by
+  Stop and by every teardown path (section 7.3).
 
 ## 12. Implementation Order
 
@@ -848,24 +1084,28 @@ per-file matching, the rollback order above, and cleanup of the empty
    previews, cancellation, cleanup, and metadata persistence.
 3. Implement root selection, shape application, and the breadth-first parser.
 4. Add `TreeEdgeGraph` construction, line tracking, and graph metrics display.
-5. Add algorithm selection adapter, Step/Start/Reset controls, and run metrics.
-6. Add vault backup, rollback confirmation, restore/reload, and cleanup. The
-  vault helper and UI rollback/cleanup controls are implemented; the future
-  layout runner must call backup creation before its first save-enabled edit.
+5. Add algorithm selection adapter, Step/Start/Reset controls, and run metrics
+   (implemented for nikogenia v1, with fixed nodes).
+6. Add vault backup, rollback dialog, restore/reload, and cleanup
+   (implemented; every layout change creates a backup first).
 7. Add focused tests for pure metadata, geometry, queue/loop handling,
    indicator sync, edge geometry, and algorithm mapping (the repository has no
-   Vitest setup yet; `syncIndicators`, edge binding and write-back, and the
-   rollback order were verified with throwaway fake-EA smoke scripts);
+   Vitest setup yet; `syncIndicators` (including fixed indicators and the
+   outset), edge binding and write-back, fixed node hydration, Reset, runs with
+   stop/continue/Finished/session end, text fitting, backup numbering, and
+   rollback to a chosen backup were verified with throwaway fake-EA smoke
+   scripts);
    then run the repository check/build and an Obsidian smoke test covering
    modal lifecycle, closing the drawing with the workbench open, popout/mobile
    behavior, selection through indicators, indicator/content moves, parsing,
-   save, rollback, and cancellation.
+   fixed nodes, text fitting, Start/Stop/Step/Reset, closing the drawing during
+   a run, save, rollback (newest and previous), and cancellation.
 
 ## 13. Acceptance Criteria for the First UI Slice
 
 - Running the script immediately opens the primary floating modal.
 - The modal contains the three sections, required labels/controls, disabled
-  states, run metrics placeholders, and the credit line.
+  states, run statistics, and the credit line.
 - Border Settings opens as a second floating modal and supports synchronized
   slider/text inputs, live red preview updates, Save, and Cancel.
 - A stored border is loaded on startup; an absent border causes no notice.
@@ -887,6 +1127,16 @@ per-file matching, the rollback order above, and cleanup of the empty
 - Parsing produces a `TreeEdgeGraph`, and each edge's line carries `mindmapEdge`
   metadata. `writeGraphToScene` with an unchanged layout leaves the drawing in
   place.
+- Fix/Unfix Selection toggles `isMindmapFixed`; fixed elements show orange
+  indicators, are loaded into the graph, and never move during Start, Step, or
+  Reset. Indicators lie 2 px outside their content.
+- Fit Selected Text Widths narrows free text without changing its line breaks.
+- Start runs nikogenia v1 on the current layout and turns into Stop; Reset applies
+  the radial area weighted initial layout; both create a backup first. Obsidian
+  stays responsive during a run, and closing the workbench or the drawing stops
+  it.
+- The rollback dialog shows the backup's name and creation time and can restore
+  a previous backup; Clear Backups shows how many backups it deletes.
 - User actions report their result with a notice.
 - The UI is implemented through documented EA/Obsidian APIs and does not
   mutate immutable scene elements directly.
@@ -917,10 +1167,20 @@ Module responsibilities:
   `saveCurrentDrawing`, `removeTemporaryElementsNow` (imperative API, usable
   during view unload).
 - `edges.ts`: pure conversion between lines and anchored edges (section 7.2).
-- `layout.ts`: `writeGraphToScene`; not called by the UI until the layout runner
-  exists.
+- `layout.ts`: `writeGraphToScene`, used by every render of Start, Step, and
+  Reset.
+- `algorithm.ts`: dropdown options, the parameter table (primary, advanced,
+  Reset), default settings from fresh core instances, `createLayoutAlgorithm`
+  (Start) and `applyInitialLayout` (Reset).
+- `runner.ts`: `LayoutRun` (time-sliced `run`, `step`, `stop`),
+  `contentVersion`, `stepTimings`.
+- `textfit.ts`: `fitTextWidths`.
+- `dom.ts`: DOM builders (texts, buttons, rows, range/number pairs with an
+  optional special maximum, checkboxes, selects, `disableControls`). Untrusted
+  strings (file names, IDs) use `addPlainText` (`textContent`), not `innerHTML`.
 - `ui.ts`: the `Workbench` runtime object (state, indicator registry, hydrated
-  nodes, border preview, child modals) and all UI actions.
+  nodes and fixed IDs, border preview, child modals, algorithm settings, current
+  run, busy flag) and all UI actions.
 
 The startup loader keeps the first root flag in stable scene order. If more
 than one element is flagged as a root, the remaining root flags are removed in
@@ -941,11 +1201,10 @@ on the lines, infers a missing shape, and clears stale mindmap relationships;
 indicators then follow from hydration.
 
 Confirmed Clear Mindmap and Clear All Metadata actions are implemented through
-unsaved metadata transactions and preserve unrelated custom data. The current
-Start action clears temporary indicators, saves the current scene once (by
-round-tripping one element through `addElementsToView(..., save = true)`), and
-then creates the backup; the future layout algorithm runner must retain that
-ordering before its first layout mutation.
+unsaved metadata transactions and preserve unrelated custom data. Before a
+layout change, `createRunBackup` clears temporary indicators, saves the current
+scene once (by round-tripping one element through
+`addElementsToView(..., save = true)`), and then creates the backup.
 
 ## 15. Correctness Notes and Key Changes
 
@@ -969,7 +1228,7 @@ scene.y = graph.y + (border.y + padding.top)
 
 `ParsedMindmap.coordinateSpace` stores this origin and the usable width and
 height. `sceneToGraphPoint` and `graphToScenePoint` are the shared conversion
-helpers; future algorithm position updates must convert graph positions back
+helpers; algorithm position updates (`writeGraphToScene`) convert graph positions back
 through `graphToScenePoint` before editing Excalidraw elements. Indicators remain
 scene overlays and therefore use the original logical element bounds directly.
 
@@ -1022,10 +1281,20 @@ while preserving folders that still contain any files.
   when the node is next moved by hand. Elbow arrows are not specifically supported.
 - **Copied elements** keep their customData, including `mindmapEdge`. Hydration
   ignores the extra claim and the next parse clears it.
-- **Core typecheck**: `core/graph/generators.ts` passes `parentId: parentId ??
-  undefined`, which `exactOptionalPropertyTypes` in this repository rejects, so
-  `npm run typecheck` reports one error there. The build is not affected. The fix
-  belongs in the simulation repository.
+- **Core typecheck**: the core is compiled with this repository's stricter
+  tsconfig (`exactOptionalPropertyTypes`, no Vite types). With the current
+  simulation-repository changes, `npm run typecheck` reports errors only in
+  `core/graph/generators.ts` (`import.meta.glob`, optional `width`/`height`/
+  `parentId` assigned as `undefined`, `unknown` arguments) and
+  `core/graph/TreeEdgeGraph.ts:75` (`edge.maxOffsetRatio = source.maxOffsetRatio`
+  may assign `undefined`). The build is not affected. The fixes belong in the
+  simulation repository.
+- **Runs on the main thread**: see section 7.3 for the reasoning. A very large
+  graph can make single steps (or Reset's rotation search) noticeably long.
+- **Edits during a run** are overwritten by the next render for moved nodes; the
+  controls that change metadata are disabled, but the canvas itself is not
+  locked.
+- **Step ignores Reset Before Start**; only Start resets automatically.
 - **Duplicate border flags** are not repaired (roots are).
 - **Rollback ends the workbench**, because the view and its script EA are
   destroyed. Re-opening it automatically would need a new EA for the reopened

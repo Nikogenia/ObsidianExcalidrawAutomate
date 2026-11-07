@@ -1,7 +1,7 @@
 import p5 from "p5";
 import { TreeEdgeGraph } from "./core/graph/TreeEdgeGraph";
 import type { TreeNode } from "./core/graph/types";
-import { readEdgeMetadata, shapeOf, type LineEnd, type MindmapPadding } from "./metadata";
+import { isFixedFlagged, readEdgeMetadata, shapeOf, type LineEnd, type MindmapPadding } from "./metadata";
 import { containerIdOf, resolveAnchor, type LogicalElement } from "./groups";
 import { bindLineToEdge, lineEndpoints, type EdgeBinding, type Point } from "./edges";
 
@@ -10,6 +10,8 @@ export interface ParsedMindmap {
     nodes: LogicalElement[];
     /** Line element of each edge, keyed by child ID like `TreeEdgeGraph.edges`. */
     edges: Map<string, EdgeBinding>;
+    /** Anchor IDs of fixed nodes (tree nodes and isolated fixed elements), in scene order. */
+    fixedIds: string[];
     coordinateSpace: CoordinateSpace;
 }
 
@@ -38,6 +40,51 @@ export function graphToScenePoint(point: Point, coordinateSpace: CoordinateSpace
 
 function customData(element: ExcalidrawElement): Record<string, unknown> {
     return (element.customData as Record<string, unknown> | undefined) ?? {};
+}
+
+function isTemporaryElement(element: ExcalidrawElement): boolean {
+    return customData(element).isMindmapTemporary === true;
+}
+
+/**
+ * Resolves every element flagged `isMindmapFixed` to its logical element.
+ *
+ * Lines, arrows, and members of the border are never fixed nodes (the UI does
+ * not flag them, and a stale flag is ignored here). Several flagged members of
+ * one group count once.
+ *
+ * @param ea Active ExcalidrawAutomate instance.
+ * @param scene Current scene elements.
+ * @param border Configured border, if any.
+ * @returns Fixed logical elements keyed by anchor ID, in scene order.
+ */
+export function resolveFixedElements(
+    ea: ExcalidrawAutomate,
+    scene: readonly ExcalidrawElement[],
+    border: LogicalElement | undefined,
+): Map<string, LogicalElement> {
+    const borderIds = new Set(border?.elements.map((element) => element.id));
+    const fixed = new Map<string, LogicalElement>();
+    for (const element of scene) {
+        if (!isFixedFlagged(element) || isTemporaryElement(element) || borderIds.has(element.id)) continue;
+        if (element.type === "line" || element.type === "arrow") continue;
+        const logical = resolveAnchor(ea, element, scene);
+        if (logical && !logical.elements.some((member) => borderIds.has(member.id))) fixed.set(logical.anchor.id, logical);
+    }
+    return fixed;
+}
+
+/**
+ * Marks fixed elements in the graph: a fixed tree node keeps its place in the
+ * tree, every other fixed element becomes an isolated node without parent edge
+ * (`TreeNode.fixed`, e.g. a logo reserving its space).
+ */
+function addFixedNodes(graph: TreeEdgeGraph, fixed: ReadonlyMap<string, LogicalElement>, space: CoordinateSpace): string[] {
+    for (const [id, logical] of fixed) {
+        if (graph.getNode(id)) graph.setFixed(id, true);
+        else graph.addNode({ ...nodeFor(logical, undefined, space), fixed: true });
+    }
+    return [...fixed.keys()];
 }
 
 function center(logical: LogicalElement): Point {
@@ -152,6 +199,7 @@ function coordinateSpace(border: LogicalElement, padding: MindmapPadding): Coord
 /**
  * Reconstructs a previously parsed graph from persisted parent/children metadata.
  * The metadata is traversed breadth-first so TreeGraph receives parents first.
+ * Fixed elements are added afterwards (`addFixedNodes`).
  */
 export function loadMindmapFromMetadata(
     ea: ExcalidrawAutomate,
@@ -159,7 +207,7 @@ export function loadMindmapFromMetadata(
     border: LogicalElement,
     padding: MindmapPadding,
 ): ParsedMindmap {
-    const scene = ea.getViewElements().filter((element) => customData(element).isMindmapTemporary !== true);
+    const scene = ea.getViewElements().filter((element) => !isTemporaryElement(element));
     const space = coordinateSpace(border, padding);
     const graph = new TreeEdgeGraph("Mindmap", root.anchor.id, space.width, space.height, MAX_OFFSET_RATIO);
     const nodes: LogicalElement[] = [root];
@@ -183,7 +231,9 @@ export function loadMindmapFromMetadata(
             graph.addNode(nodeFor(child, parent.anchor.id, space));
         }
     }
-    return { graph, nodes, edges: hydrateEdges(graph, scene), coordinateSpace: space };
+    const edges = hydrateEdges(graph, scene);
+    const fixedIds = addFixedNodes(graph, resolveFixedElements(ea, scene, border), space);
+    return { graph, nodes, edges, fixedIds, coordinateSpace: space };
 }
 
 /**
@@ -275,5 +325,5 @@ export function parseMindmap(
 
     console.log(`Parsed ${nodes.length} nodes from mindmap. Serialized graph:`);
     console.log(graph.serialize());
-    return { graph, nodes, edges, coordinateSpace: space };
+    return { graph, nodes, edges, fixedIds: [], coordinateSpace: space };
 }

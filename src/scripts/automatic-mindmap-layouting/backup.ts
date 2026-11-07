@@ -5,6 +5,17 @@ export interface MindmapBackup {
     run: number;
 }
 
+/**
+ * Creation time of a backup. `TFile.stat.ctime` is set by `Vault.create` and
+ * survives a vault reload, unlike anything kept in memory.
+ *
+ * @param backup Backup file.
+ * @returns Localized date and time.
+ */
+export function backupCreatedAt(backup: MindmapBackup): string {
+    return new Date(backup.file.stat.ctime).toLocaleString();
+}
+
 function directoryOf(path: string): string {
     const separator = path.lastIndexOf("/");
     return separator < 0 ? "" : path.slice(0, separator);
@@ -44,7 +55,7 @@ function emptyBackupFolder(app: App, path: string): TFolder | undefined {
     return !hasFiles ? folder as TFolder : undefined;
 }
 
-/** Returns backups belonging exactly to the active drawing file. */
+/** Returns backups belonging exactly to the active drawing file, newest (highest run) first. */
 export function listMindmapBackups(app: App, file: TFile): MindmapBackup[] {
     return matchingBackups(app, file);
 }
@@ -57,9 +68,9 @@ export async function createMindmapBackup(app: App, file: TFile): Promise<Mindma
     const folderPath = backupFolderPath(file);
     if (!app.vault.getAbstractFileByPath(folderPath)) await app.vault.createFolder(folderPath);
     const content = await app.vault.read(file);
-    const existingRuns = new Set(matchingBackups(app, file).map((backup) => backup.run));
-    let run = 1;
-    while (existingRuns.has(run)) run++;
+    // Highest run + 1 rather than the first free number: after an older backup was
+    // restored (and consumed), a reused number would sort before newer backups.
+    let run = (matchingBackups(app, file)[0]?.run ?? 0) + 1;
     while (true) {
         const path = `${folderPath}/${basenameOf(file.path)}.run${run}.backup`;
         try {
@@ -153,7 +164,9 @@ export async function closeViewsOfFile(app: App, file: TFile): Promise<Workspace
 }
 
 /**
- * Restores and then consumes the newest backup for the drawing.
+ * Restores and then consumes one backup of the drawing (the newest one for a
+ * plain Rollback, an older one when chosen in the dialog). Newer backups are
+ * kept.
  *
  * The backup is read before anything is changed and deleted only after the
  * restored content was verified and the drawing reopened, so a failure never
@@ -161,13 +174,13 @@ export async function closeViewsOfFile(app: App, file: TFile): Promise<Workspace
  * reopening, so verifying the file there cannot mistake a legitimate save of the
  * reopened view for an overwrite.
  */
-export async function rollbackLatestMindmapBackup(
+export async function rollbackMindmapBackup(
     app: App,
     file: TFile,
+    backup: MindmapBackup,
     hooks: RollbackHooks,
 ): Promise<boolean> {
-    const backup = matchingBackups(app, file)[0];
-    if (!backup) return false;
+    if (!matchingBackups(app, file).some((candidate) => candidate.file.path === backup.file.path)) return false;
     const content = await app.vault.read(backup.file);
     await hooks.beforeWrite();
     await waitForFileQuiet(app, file);
@@ -184,12 +197,17 @@ export async function rollbackLatestMindmapBackup(
     return true;
 }
 
-/** Removes only this drawing's backups and their folder when it becomes empty. */
-export async function clearMindmapBackups(app: App, file: TFile): Promise<void> {
+/**
+ * Removes only this drawing's backups and their folder when it becomes empty.
+ *
+ * @returns The number of deleted backups.
+ */
+export async function clearMindmapBackups(app: App, file: TFile): Promise<number> {
     const backups = matchingBackups(app, file);
     for (const backup of backups) await app.vault.delete(backup.file);
     const folder = emptyBackupFolder(app, backupFolderPath(file));
     if (folder) {
         await app.vault.delete(folder, true);
     }
+    return backups.length;
 }

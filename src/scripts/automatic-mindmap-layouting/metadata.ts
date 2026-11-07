@@ -156,6 +156,16 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
     return state;
 }
 
+/**
+ * Returns whether an element carries the fixed node flag (`isMindmapFixed`).
+ *
+ * @param element Scene element.
+ * @returns True for a flagged anchor.
+ */
+export function isFixedFlagged(element: ExcalidrawElement): boolean {
+    return getCustomDataValue(element.customData as Record<string, unknown> | undefined, "isMindmapFixed") === true;
+}
+
 function isFiniteNumber(value: unknown): value is number {
     return typeof value === "number" && Number.isFinite(value);
 }

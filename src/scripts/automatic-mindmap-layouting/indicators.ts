@@ -2,7 +2,7 @@ import { shapeOf, type MindmapPadding, type MindmapShape } from "./metadata";
 import { resolveAnchorId, type LogicalElement } from "./groups";
 import { CAPTURE_NEVER, isTemporary, moveElements, removeTemporaryElementsNow } from "./scene";
 
-export type IndicatorKind = "border" | "root" | "node" | "arrow";
+export type IndicatorKind = "border" | "root" | "node" | "fixed" | "arrow";
 type IndicatorType = "rectangle" | "ellipse" | "arrow";
 type Points = [number, number][];
 
@@ -47,6 +47,8 @@ export interface IndicatorModel {
     padding: MindmapPadding;
     rootId?: string;
     nodes: readonly IndicatorNode[];
+    /** Anchor IDs of fixed elements (tree nodes or isolated). */
+    fixedIds: readonly string[];
 }
 
 interface IndicatorSpec {
@@ -74,9 +76,19 @@ const COLORS: Record<IndicatorKind, string> = {
     border: "#e03131",
     root: "#1971c2",
     node: "#2f9e44",
+    fixed: "#f08c00",
     arrow: "#2f9e44",
 };
 const EPSILON = 0.5;
+/**
+ * Indicators around elements are drawn this far outside the element bounds, so
+ * they stay visible when they would otherwise coincide with the outline of a
+ * node's own border element. The border indicator marks the layout area and is
+ * not inflated.
+ */
+const INDICATOR_OUTSET = 2;
+/** A fixed root shows both rings; the orange one is drawn outside the blue one. */
+const FIXED_ROOT_OUTSET = 6;
 const MAX_ARROW_LENGTH = 60;
 
 /** Creates an empty runtime indicator registry. */
@@ -90,6 +102,15 @@ function paddedBounds(bounds: Bounds, padding: MindmapPadding): Bounds {
         y: bounds.y + padding.top,
         width: Math.max(1, bounds.width - padding.left - padding.right),
         height: Math.max(1, bounds.height - padding.top - padding.bottom),
+    };
+}
+
+function inflate(bounds: Bounds, outset: number): Bounds {
+    return {
+        x: bounds.x - outset,
+        y: bounds.y - outset,
+        width: bounds.width + 2 * outset,
+        height: bounds.height + 2 * outset,
     };
 }
 
@@ -148,7 +169,7 @@ function shapeSpec(
     kind: IndicatorKind,
     logical: LogicalElement,
     shape: MindmapShape,
-    geometry: Bounds = logical.bounds,
+    geometry: Bounds = inflate(logical.bounds, INDICATOR_OUTSET),
 ): IndicatorSpec {
     return {
         key,
@@ -167,11 +188,13 @@ function nodeSpecs(
     excludedIds: ReadonlySet<string>,
 ): IndicatorSpec[] {
     const specs: IndicatorSpec[] = [];
+    const fixedIds = new Set(model.fixedIds);
     for (const node of model.nodes) {
         if (node.id === model.rootId || excludedIds.has(node.id)) continue;
         const logical = resolve(node.id);
         if (!logical) continue;
-        specs.push(shapeSpec(`node:${node.id}`, "node", logical, node.shape));
+        // A fixed node shows the orange fixed indicator instead of the green one; its arrow stays.
+        if (!fixedIds.has(node.id)) specs.push(shapeSpec(`node:${node.id}`, "node", logical, node.shape));
         const parent = resolve(node.parentId);
         if (!parent) continue;
         specs.push({
@@ -183,6 +206,21 @@ function nodeSpecs(
             contentBounds: { ...logical.bounds },
             color: COLORS.arrow,
         });
+    }
+    return specs;
+}
+
+function fixedSpecs(
+    model: IndicatorModel,
+    resolve: (id: string | undefined) => LogicalElement | undefined,
+    excludedIds: ReadonlySet<string>,
+): IndicatorSpec[] {
+    const specs: IndicatorSpec[] = [];
+    for (const id of model.fixedIds) {
+        const logical = excludedIds.has(id) ? undefined : resolve(id);
+        if (!logical) continue;
+        const outset = id === model.rootId ? FIXED_ROOT_OUTSET : INDICATOR_OUTSET;
+        specs.push(shapeSpec(`fixed:${id}`, "fixed", logical, shapeOf(logical.anchor), inflate(logical.bounds, outset)));
     }
     return specs;
 }
@@ -210,6 +248,7 @@ function buildSpecs(ea: ExcalidrawAutomate, model: IndicatorModel, scene: readon
     if (root) specs.push(shapeSpec("root", "root", root, shapeOf(root.anchor)));
     const borderIds = new Set(border?.elements.map((element) => element.id));
     specs.push(...nodeSpecs(model, resolve, borderIds));
+    specs.push(...fixedSpecs(model, resolve, borderIds));
     return { specs, logicals };
 }
 

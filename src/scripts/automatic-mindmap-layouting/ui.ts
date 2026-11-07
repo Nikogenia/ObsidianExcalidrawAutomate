@@ -8,9 +8,9 @@ import {
     type IndicatorState,
 } from "./indicators";
 import {
-    clampInteger,
     DEFAULT_CONNECTION_DISTANCE,
     DEFAULT_PADDING,
+    isFixedFlagged,
     loadRuntimeState,
     normalizeShape,
     shapeOf,
@@ -18,21 +18,66 @@ import {
     type MindmapRuntimeState,
 } from "./metadata";
 import { normalizeBoundText, resolveAnchor, resolveAnchorId, resolveLogicalSelection, type LogicalElement } from "./groups";
-import { loadMindmapFromMetadata, parseMindmap } from "./parser";
+import { loadMindmapFromMetadata, parseMindmap, resolveFixedElements, type ParsedMindmap } from "./parser";
 import { edgeMetadata } from "./edges";
+import { writeGraphToScene } from "./layout";
+import { fitTextWidths } from "./textfit";
+import {
+    ADVANCED_PARAMETERS,
+    ALGORITHM_OPTIONS,
+    applyInitialLayout,
+    createLayoutAlgorithm,
+    defaultAlgorithmSettings,
+    ALGORITHM_SETTINGS_KEY,
+    applyStoredSettings,
+    INITIAL_LAYOUT_PARAMETERS,
+    isBooleanParameter,
+    readStoredSettings,
+    sameStoredSettings,
+    toStoredSettings,
+    PRIMARY_PARAMETERS,
+    STEPS_FINISHED,
+    stepsPerRenderLimit,
+    type AlgorithmId,
+    type AlgorithmSettings,
+    type Parameter,
+    type StoredAlgorithmSettings,
+} from "./algorithm";
+import { contentVersion, LayoutRun, stepTimings, type RunHooks } from "./runner";
 import { calculateTreeEdgeGraphMetricsString } from "./core/graph/evaluationEdge";
 import {
+    backupCreatedAt,
     clearMindmapBackups,
     closeViewsOfFile,
     createMindmapBackup,
     listMindmapBackups,
-    rollbackLatestMindmapBackup,
+    rollbackMindmapBackup,
+    type MindmapBackup,
 } from "./backup";
 import { saveCurrentDrawing, saveMetadata, type MetadataPatch } from "./scene";
 import { WorkbenchSession, type TeardownReason } from "./session";
+import {
+    addActions,
+    addButton,
+    addCheckbox,
+    addPlainText,
+    addRangePair,
+    addRow,
+    addSection,
+    addSelect,
+    addSpacer,
+    addText,
+    disableControls,
+} from "./dom";
 
 type Notify = (message: string) => void;
 type WorkspaceLeaf = WorkbenchSession["view"]["leaf"];
+
+interface ProgressElements {
+    steps: HTMLElement;
+    timings: HTMLElement;
+    status: HTMLElement;
+}
 
 /** Runtime state of one open workbench. */
 interface Workbench {
@@ -42,105 +87,33 @@ interface Workbench {
     indicators: IndicatorState;
     /** Parsed nodes, always re-derived from persisted metadata (see `hydrate`). */
     nodes: IndicatorNode[];
+    /** Anchor IDs of fixed elements, re-derived from metadata like `nodes`. */
+    fixedIds: string[];
     /** Uncommitted Border Settings candidate shown instead of the saved border. */
     borderPreview?: { borderId?: string; padding: MindmapPadding };
     childModals: Set<{ close: () => void }>;
     statsEl?: HTMLElement;
+    progressEls?: ProgressElements;
+    /** Controls whose state follows settings and scene changes without a re-render (`updateControls`). */
+    controls?: { start?: HTMLButtonElement; restoreStored?: HTMLButtonElement; save?: HTMLButtonElement };
+    /** Mindmap parameters stored on the root (`mindmapAlgorithmSettings`), re-read by `hydrate`. */
+    storedSettings?: StoredAlgorithmSettings | undefined;
     presence: string;
     connectionTimer?: number;
+    settings: AlgorithmSettings;
+    /** Current or last layout run; a stopped, unfinished run can be continued. */
+    run?: LayoutRun;
+    /** True while Start, Step, or Reset owns the scene; refreshes and other actions pause. */
+    busy: boolean;
+    runStatus: string;
     notify: Notify;
     render: () => void;
 }
 
 const NODE_KEYS = ["isMindmapNode", "mindmapParent", "mindmapChildren", "isMindmapEdge", "mindmapEdge"];
-const ALL_KEYS = ["isMindmapBorder", "mindmapPadding", "isMindmapRoot", "mindmapShape", "mindmapConnectionDistance", ...NODE_KEYS];
+const ALL_KEYS = ["isMindmapBorder", "mindmapPadding", "isMindmapRoot", "mindmapShape", "mindmapConnectionDistance", "isMindmapFixed", ALGORITHM_SETTINGS_KEY, ...NODE_KEYS];
 const DEBOUNCE_MS = 120;
-
-function addText(parent: HTMLElement, text: string): HTMLParagraphElement {
-    const element = parent.ownerDocument.createElement("p");
-    element.innerHTML = text;
-    element.style.margin = "0";
-    parent.appendChild(element);
-    return element;
-}
-
-function addButton(parent: HTMLElement, label: string): HTMLButtonElement {
-    const button = parent.ownerDocument.createElement("button");
-    button.type = "button";
-    button.textContent = label;
-    parent.appendChild(button);
-    return button;
-}
-
-function addSpacer(parent: HTMLElement, height: string): void {
-    const spacer = parent.ownerDocument.createElement("div");
-    spacer.style.height = height;
-    parent.appendChild(spacer);
-}
-
-function addSection(parent: HTMLElement, title: string): HTMLElement {
-    const section = parent.ownerDocument.createElement("section");
-    const heading = parent.ownerDocument.createElement("h3");
-    heading.textContent = title;
-    section.appendChild(heading);
-    section.style.display = "flex";
-    section.style.flexDirection = "column";
-    section.style.gap = "0.45em";
-    section.style.margin = "0 0 0.8em";
-    parent.appendChild(section);
-    return section;
-}
-
-function addRow(parent: HTMLElement, columns: string): HTMLDivElement {
-    const row = parent.ownerDocument.createElement("div");
-    row.style.display = "grid";
-    row.style.gap = "0.5em";
-    row.style.gridTemplateColumns = columns;
-    parent.appendChild(row);
-    return row;
-}
-
-function addRangePair(
-    parent: HTMLElement,
-    label: string,
-    minimum: number,
-    maximum: number,
-    initial: number,
-    onChange: (value: number) => void,
-    minLabelWidth?: string,
-): void {
-    const row = parent.ownerDocument.createElement("div");
-    row.style.display = "flex";
-    row.style.alignItems = "center";
-    row.style.gap = "0.5em";
-    const labelEl = parent.ownerDocument.createElement("label");
-    labelEl.textContent = label;
-    if (minLabelWidth) {
-        labelEl.style.minWidth = minLabelWidth;
-    }
-    const range = parent.ownerDocument.createElement("input");
-    range.type = "range";
-    range.min = String(minimum);
-    range.max = String(maximum);
-    range.value = String(initial);
-    const number = parent.ownerDocument.createElement("input");
-    number.type = "number";
-    number.min = String(minimum);
-    number.max = String(maximum);
-    number.value = String(initial);
-    range.style.flex = "1 1 auto";
-    number.style.width = "5em";
-    const update = (source: HTMLInputElement): void => {
-        const value = clampInteger(source.value, minimum, maximum, initial);
-        range.value = String(value);
-        number.value = String(value);
-        onChange(value);
-    };
-    range.addEventListener("input", () => update(range));
-    number.addEventListener("input", () => update(number));
-    row.append(labelEl, range, number);
-    parent.appendChild(row);
-}
+const LABEL_WIDTH = "13em";
 
 function customData(element: ExcalidrawElement): Record<string, unknown> {
     return (element.customData as Record<string, unknown> | undefined) ?? {};
@@ -148,6 +121,10 @@ function customData(element: ExcalidrawElement): Record<string, unknown> {
 
 function isNode(element: ExcalidrawElement): boolean {
     return customData(element).isMindmapNode === true;
+}
+
+function plural(count: number, word: string): string {
+    return `${count} ${word}${count === 1 ? "" : "s"}`;
 }
 
 function confirmAction(
@@ -159,18 +136,12 @@ function confirmAction(
     modal.onOpen = () => {
         modal.contentEl.empty();
         addText(modal.contentEl, message);
-        const actions = modal.contentEl.ownerDocument.createElement("div");
-        actions.style.display = "flex";
-        actions.style.justifyContent = "flex-end";
-        actions.style.gap = "0.5em";
-        const confirm = addButton(actions, "Confirm");
-        const cancel = addButton(actions, "Cancel");
-        confirm.addEventListener("click", () => {
+        const actions = addActions(modal.contentEl);
+        addButton(actions, "Confirm").addEventListener("click", () => {
             modal.close();
             void action();
         });
-        cancel.addEventListener("click", () => modal.close());
-        modal.contentEl.appendChild(actions);
+        addButton(actions, "Cancel").addEventListener("click", () => modal.close());
     };
     modal.open();
 }
@@ -206,25 +177,35 @@ function reportError(wb: Workbench, message: string, error: unknown): void {
     wb.notify(message);
 }
 
+/** Current selection with indicators replaced by their owners. */
+function selectedOwners(wb: Workbench): { selection: ExcalidrawElement[]; scene: readonly ExcalidrawElement[] } {
+    const scene = wb.ea.getViewElements();
+    return { selection: resolveIndicatorOwners(wb.ea.getViewSelectedElements(), scene), scene };
+}
+
 /**
  * Resolves the canvas selection to one logical element. Selected indicators
  * count as their content, so a click on an indicator selects its node.
  */
 function selectedLogical(wb: Workbench): LogicalElement | undefined {
-    const scene = wb.ea.getViewElements();
-    return resolveLogicalSelection(wb.ea, resolveIndicatorOwners(wb.ea.getViewSelectedElements(), scene), scene);
+    const { selection, scene } = selectedOwners(wb);
+    return resolveLogicalSelection(wb.ea, selection, scene);
+}
+
+/** Resolves every selected element (or indicator) to its logical element, once per anchor. */
+function selectedLogicals(wb: Workbench): LogicalElement[] {
+    const { selection, scene } = selectedOwners(wb);
+    const logicals = new Map<string, LogicalElement>();
+    for (const element of normalizeBoundText(selection, scene)) {
+        const logical = resolveAnchor(wb.ea, element, scene);
+        if (logical) logicals.set(logical.anchor.id, logical);
+    }
+    return [...logicals.values()];
 }
 
 /** Returns the anchors of all selected mindmap nodes, selected directly or via an indicator. */
 function selectedNodeAnchors(wb: Workbench): ExcalidrawElement[] {
-    const scene = wb.ea.getViewElements();
-    const owners = normalizeBoundText(resolveIndicatorOwners(wb.ea.getViewSelectedElements(), scene), scene);
-    const anchors = new Map<string, ExcalidrawElement>();
-    for (const element of owners) {
-        const logical = resolveAnchor(wb.ea, element, scene);
-        if (logical && isNode(logical.anchor)) anchors.set(logical.anchor.id, logical.anchor);
-    }
-    return [...anchors.values()];
+    return selectedLogicals(wb).map((logical) => logical.anchor).filter(isNode);
 }
 
 function indicatorModel(wb: Workbench): IndicatorModel {
@@ -235,26 +216,42 @@ function indicatorModel(wb: Workbench): IndicatorModel {
         padding: preview?.padding ?? wb.state.padding,
         ...(wb.state.rootId ? { rootId: wb.state.rootId } : {}),
         nodes: wb.nodes,
+        fixedIds: wb.fixedIds,
     };
+}
+
+/** Loads a new graph from metadata and the live scene, or undefined without root and border. */
+function loadMindmap(wb: Workbench): ParsedMindmap | undefined {
+    const scene = wb.ea.getViewElements();
+    const border = resolveAnchorId(wb.ea, wb.state.borderId, scene);
+    const root = resolveAnchorId(wb.ea, wb.state.rootId, scene);
+    return border && root ? loadMindmapFromMetadata(wb.ea, root, border, wb.state.padding) : undefined;
 }
 
 /**
  * Rebuilds the graph and the node list from persisted metadata and the live
  * scene. Metadata is the single source of truth, so moved content updates the
  * graph positions and deleted content drops out of the graph (with its subtree,
- * until the next parse).
+ * until the next parse). Fixed elements are shown even before a root and a
+ * border exist.
  */
+function readRootSettings(wb: Workbench): StoredAlgorithmSettings | undefined {
+    const root = wb.state.rootId ? wb.ea.getViewElements().find((element) => element.id === wb.state.rootId) : undefined;
+    return root ? readStoredSettings(customData(root)[ALGORITHM_SETTINGS_KEY]) : undefined;
+}
+
 function hydrate(wb: Workbench): void {
-    const scene = wb.ea.getViewElements();
-    const border = resolveAnchorId(wb.ea, wb.state.borderId, scene);
-    const root = resolveAnchorId(wb.ea, wb.state.rootId, scene);
-    if (!border || !root) {
+    wb.storedSettings = readRootSettings(wb);
+    const loaded = loadMindmap(wb);
+    if (!loaded) {
+        const scene = wb.ea.getViewElements();
         delete wb.state.mindmap;
         wb.nodes = [];
+        wb.fixedIds = [...resolveFixedElements(wb.ea, scene, resolveAnchorId(wb.ea, wb.state.borderId, scene)).keys()];
         return;
     }
-    const loaded = loadMindmapFromMetadata(wb.ea, root, border, wb.state.padding);
     wb.state.mindmap = loaded;
+    wb.fixedIds = loaded.fixedIds;
     wb.nodes = loaded.nodes.slice(1).map((logical) => {
         const node = loaded.graph.getNode(logical.anchor.id);
         return {
@@ -268,22 +265,36 @@ function hydrate(wb: Workbench): void {
 function presenceKey(wb: Workbench): string {
     const scene = wb.ea.getViewElements();
     const has = (id: string | undefined): boolean => Boolean(id && scene.some((element) => element.id === id));
-    return JSON.stringify([has(wb.state.borderId), has(wb.state.rootId), Boolean(wb.state.mindmap), scene.some(isNode)]);
+    return JSON.stringify([has(wb.state.borderId), has(wb.state.rootId), Boolean(wb.state.mindmap), scene.some(isNode), wb.fixedIds.length]);
+}
+
+/** The graph shown in the statistics: the run's live graph while it owns the scene. */
+function displayedGraph(wb: Workbench): ParsedMindmap["graph"] | undefined {
+    return wb.busy && wb.run ? wb.run.mindmap.graph : wb.state.mindmap?.graph;
 }
 
 function statsHtml(wb: Workbench): string {
-    return wb.state.mindmap
-        ? `Graph Statistics:<br>${calculateTreeEdgeGraphMetricsString(wb.state.mindmap.graph).replace(/\n/g, "<br>")}`
+    const graph = displayedGraph(wb);
+    return graph
+        ? `Graph Statistics:<br>${calculateTreeEdgeGraphMetricsString(graph).replace(/\n/g, "<br>")}`
         : "Graph Statistics: Available after parsing";
+}
+
+/** True when a parsed graph with at least one non-root node exists. */
+function graphReady(wb: Workbench): boolean {
+    return Boolean(wb.state.mindmap) && wb.nodes.length > 0;
 }
 
 /**
  * Re-derives graph and indicators from the scene. Runs after every debounced
  * scene change, so moving or deleting content (or an indicator) is reflected
  * immediately. Re-renders the modal only when border/root/graph presence
- * changed; otherwise only the statistics text is updated.
+ * changed; otherwise only the statistics text is updated. Skipped while a run
+ * owns the scene: the run keeps its own graph and its writes would otherwise
+ * replace it (spec 7.3).
  */
 async function refresh(wb: Workbench): Promise<void> {
+    if (wb.busy) return;
     try {
         await wb.session.run(async () => {
             hydrate(wb);
@@ -293,9 +304,12 @@ async function refresh(wb: Workbench): Promise<void> {
     } catch (error) {
         reportError(wb, "Could not update the mindmap indicators.", error);
     }
-    if (!wb.session.alive) return;
+    if (!wb.session.alive || wb.busy) return;
     if (presenceKey(wb) !== wb.presence) wb.render();
-    else if (wb.statsEl) wb.statsEl.innerHTML = statsHtml(wb);
+    else {
+        if (wb.statsEl) wb.statsEl.innerHTML = statsHtml(wb);
+        updateControls(wb);
+    }
 }
 
 async function repairRootFlags(wb: Workbench): Promise<void> {
@@ -350,7 +364,7 @@ async function parseCurrentMindmap(wb: Workbench): Promise<void> {
             await saveMetadata(ea, parsePatches(wb, parsed));
             hydrate(wb);
             await syncIndicators(ea, wb.indicators, indicatorModel(wb));
-            return wb.notify(`Mindmap parsed: ${parsed.nodes.length} nodes, ${parsed.edges.size} edges.`);
+            return wb.notify(`Mindmap parsed: ${plural(parsed.nodes.length, "node")}, ${plural(parsed.edges.size, "edge")}.`);
         });
     } catch (error) {
         reportError(wb, "Could not parse the mindmap.", error);
@@ -368,8 +382,11 @@ async function selectRoot(wb: Workbench): Promise<void> {
     await wb.session.run(async () => {
         const oldRoots = wb.ea.getViewElements()
             .filter((element) => customData(element).isMindmapRoot === true && element.id !== selected.anchor.id);
+        // Stored parameters follow the root unless the new root brings its own.
+        const keepOwn = readStoredSettings(customData(selected.anchor)[ALGORITHM_SETTINGS_KEY]) !== undefined;
+        const moved = keepOwn ? undefined : wb.storedSettings;
         await saveMetadata(wb.ea, [
-            ...oldRoots.map((element) => ({ id: element.id, patch: { isMindmapRoot: undefined } })),
+            ...oldRoots.map((element) => ({ id: element.id, patch: { isMindmapRoot: undefined, [ALGORITHM_SETTINGS_KEY]: undefined } })),
             {
                 id: selected.anchor.id,
                 patch: {
@@ -378,6 +395,7 @@ async function selectRoot(wb: Workbench): Promise<void> {
                     mindmapShape: shape,
                     mindmapConnectionDistance: wb.state.connectionDistance,
                     mindmapChildren: [],
+                    ...(moved ? { [ALGORITHM_SETTINGS_KEY]: moved } : {}),
                 },
             },
         ]);
@@ -400,7 +418,57 @@ async function applyShape(wb: Workbench, value: string): Promise<void> {
         if (anchors.some((element) => element.id === wb.state.rootId)) wb.state.rootShape = shape;
     });
     await refresh(wb);
-    wb.notify(`Shape "${shape}" applied to ${anchors.length} node${anchors.length === 1 ? "" : "s"}.`);
+    wb.notify(`Shape "${shape}" applied to ${plural(anchors.length, "node")}.`);
+}
+
+/**
+ * Adds or removes the fixed flag (`isMindmapFixed`) on the selected logical
+ * elements. The flag is stored on the anchor; removing also clears flags left
+ * on other group members. The border and lines cannot be fixed nodes.
+ */
+async function setSelectionFixed(wb: Workbench, fixed: boolean): Promise<void> {
+    const scene = wb.ea.getViewElements();
+    const borderIds = new Set(resolveAnchorId(wb.ea, wb.state.borderId, scene)?.elements.map((element) => element.id));
+    const logicals = selectedLogicals(wb).filter((logical) =>
+        logical.anchor.type !== "line" && logical.anchor.type !== "arrow"
+        && !logical.elements.some((element) => borderIds.has(element.id)));
+    if (logicals.length === 0) {
+        wb.notify("Select at least one element or group (not the border or a line).");
+        return;
+    }
+    const patches: MetadataPatch[] = fixed
+        ? logicals.filter((logical) => !isFixedFlagged(logical.anchor)).map((logical) => ({ id: logical.anchor.id, patch: { isMindmapFixed: true } }))
+        : logicals.flatMap((logical) => logical.elements.filter(isFixedFlagged).map((element) => ({ id: element.id, patch: { isMindmapFixed: undefined } })));
+    const changed = new Set(fixed ? patches.map(({ id }) => id) : logicals.filter((logical) => logical.elements.some(isFixedFlagged)).map((logical) => logical.anchor.id));
+    try {
+        if (patches.length > 0) await wb.session.run(() => saveMetadata(wb.ea, patches));
+    } catch (error) {
+        reportError(wb, "Could not save the fixed nodes.", error);
+        return;
+    }
+    await refresh(wb);
+    if (fixed) wb.notify(changed.size > 0 ? `${plural(changed.size, "element")} fixed.` : "The selected elements are already fixed.");
+    else wb.notify(changed.size > 0 ? `${plural(changed.size, "element")} no longer fixed.` : "None of the selected elements is fixed.");
+}
+
+async function fitSelectedTextWidths(wb: Workbench): Promise<void> {
+    const { selection } = selectedOwners(wb);
+    const texts = selection.filter((element) =>
+        element.type === "text" && !(element as ExcalidrawElement & { containerId?: string | null }).containerId);
+    if (texts.length === 0) {
+        wb.notify("Select at least one text element that is not inside a container.");
+        return;
+    }
+    try {
+        const result = await wb.session.run(() => fitTextWidths(wb.ea, texts));
+        if (!result) return;
+        const parts = [`${plural(result.fitted, "text box")} narrowed`];
+        if (result.unchanged > 0) parts.push(`${result.unchanged} already minimal`);
+        if (result.skipped > 0) parts.push(`${result.skipped} skipped (line breaks could not be kept)`);
+        wb.notify(`${parts.join(", ")}.`);
+    } catch (error) {
+        reportError(wb, "Could not fit the text widths.", error);
+    }
 }
 
 function saveConnectionDistance(wb: Workbench, value: number): void {
@@ -432,35 +500,264 @@ async function clearMindmapMetadata(wb: Workbench, clearAll: boolean): Promise<v
     wb.notify(clearAll ? "All mindmap metadata cleared." : "Mindmap node and edge metadata cleared.");
 }
 
-async function startRun(wb: Workbench): Promise<void> {
-    wb.notify("Starting Mindmap Layouting... (This is a placeholder action.)");
+// LAYOUT RUNS
+
+/**
+ * Removes the indicators, saves the drawing, and copies the file into a new
+ * backup. Every layout change (Start, Step, Reset) is preceded by this; a
+ * failed backup cancels the layout change.
+ */
+async function createRunBackup(wb: Workbench): Promise<boolean> {
     try {
         const backup = await wb.session.run(async () => {
             clearIndicatorsNow(wb.session.api, wb.indicators);
             await saveCurrentDrawing(wb.ea);
             return createMindmapBackup(wb.session.app, wb.session.file);
         });
-        if (backup) wb.notify(`Mindmap Backup Created: ${backup.file.path}`);
+        if (!backup) return false;
+        wb.notify(`Mindmap backup created: ${backup.file.name}`);
+        return true;
     } catch (error) {
-        reportError(wb, "Could not create the mindmap backup.", error);
+        reportError(wb, "Could not create the mindmap backup; the layout was not changed.", error);
+        return false;
     }
-    await refresh(wb);
-    if (wb.session.alive) wb.render();
+}
+
+/** A stopped run may continue only if nobody changed the drawing since its last write. */
+function continuableRun(wb: Workbench): LayoutRun | undefined {
+    const run = wb.run;
+    if (!run || run.running || run.completed) return undefined;
+    return run.writtenVersion === contentVersion(wb.ea.getViewElements()) ? run : undefined;
+}
+
+/** Discards a stopped run, for example after its parameters changed. */
+function invalidateRun(wb: Workbench): void {
+    if (wb.run && !wb.run.running) delete wb.run;
+    updateControls(wb);
+}
+
+/** Start label: Stop while running, Resume while the stopped run can be continued, otherwise Start. */
+function startLabel(wb: Workbench): string {
+    if (wb.run?.running) return "Stop";
+    return !wb.settings.resetBeforeStart && continuableRun(wb) ? "Resume" : "Start";
 }
 
 /**
- * Restores the newest backup by closing every view of the drawing, writing the
- * file, and reopening it in the original leaf. The workbench ends, because its
- * EA is destroyed together with the closed view.
+ * Updates the controls that depend on settings and on the scene without
+ * rebuilding the modal (sliders keep their drag state): the Start/Resume label
+ * and the two mindmap parameter buttons.
  */
-async function rollback(wb: Workbench): Promise<void> {
+function updateControls(wb: Workbench): void {
+    const controls = wb.controls;
+    if (!controls || !wb.session.alive) return;
+    if (controls.start) controls.start.textContent = startLabel(wb);
+    const same = wb.storedSettings !== undefined && sameStoredSettings(toStoredSettings(wb.settings), wb.storedSettings);
+    if (controls.save) controls.save.disabled = !wb.state.rootId || same;
+    if (controls.restoreStored) controls.restoreStored.disabled = !wb.storedSettings || same;
+}
+
+/**
+ * Stores the current algorithm settings on the root. Only the root's metadata
+ * changes, so a stopped run stays continuable.
+ */
+async function saveMindmapParameters(wb: Workbench): Promise<void> {
+    const rootId = wb.state.rootId;
+    if (!rootId) {
+        wb.notify("Select a Root Element first; the mindmap parameters are stored on the root.");
+        return;
+    }
+    const stored = toStoredSettings(wb.settings);
+    const resumable = continuableRun(wb);
+    try {
+        await wb.session.run(async () => {
+            await saveMetadata(wb.ea, [{ id: rootId, patch: { [ALGORITHM_SETTINGS_KEY]: stored } }]);
+            if (resumable) resumable.writtenVersion = contentVersion(wb.ea.getViewElements());
+        });
+    } catch (error) {
+        reportError(wb, "Could not save the mindmap parameters.", error);
+        return;
+    }
+    wb.storedSettings = stored;
+    updateControls(wb);
+    wb.notify("Mindmap parameters saved to the root element.");
+}
+
+function restoreSettings(wb: Workbench, stored: StoredAlgorithmSettings, message: string): void {
+    wb.settings = applyStoredSettings(wb.settings, stored);
+    invalidateRun(wb);
+    wb.render();
+    wb.notify(message);
+}
+
+function runHooks(wb: Workbench, run: LayoutRun): RunHooks {
+    return {
+        stepsPerRender: () => stepsPerRenderLimit(wb.settings),
+        render: async () => {
+            if (!wb.session.alive) return false;
+            const written = await wb.session.run(async () => {
+                await writeGraphToScene(wb.ea, run.mindmap);
+                run.writtenVersion = contentVersion(wb.ea.getViewElements());
+                return true;
+            });
+            return written === true && wb.session.alive;
+        },
+        progress: () => updateProgress(wb),
+    };
+}
+
+/**
+ * Prepares a new run on the current layout: backup, new graph from metadata,
+ * optionally the initial layout (Reset Before Start), and the initialized
+ * algorithm.
+ */
+async function createRun(wb: Workbench, withReset: boolean): Promise<LayoutRun | undefined> {
+    if (!await createRunBackup(wb)) return undefined;
+    const mindmap = loadMindmap(wb);
+    if (!mindmap) {
+        wb.notify("Configure a Border and a Root and parse the mindmap first.");
+        return undefined;
+    }
+    if (withReset) applyInitialLayout(mindmap.graph, wb.settings);
+    return new LayoutRun(createLayoutAlgorithm(mindmap.graph, wb.settings), mindmap);
+}
+
+/** Owns the scene for the duration of `action`, then restores indicators and the UI. */
+async function withBusy(wb: Workbench, action: () => Promise<void>): Promise<void> {
+    if (wb.busy) return;
+    wb.busy = true;
+    wb.render();
+    try {
+        await action();
+    } finally {
+        wb.busy = false;
+        if (wb.session.alive) {
+            await refresh(wb);
+            wb.render();
+        }
+    }
+}
+
+function runSummary(run: LayoutRun): string {
+    return `step ${run.algorithm.currentIteration} / ${run.algorithm.iterations}`;
+}
+
+/**
+ * Start: runs nikogenia v1 on the current layout (initiation mode "none") until
+ * it completes or Stop is pressed. A stopped run continues where it stopped as
+ * long as the drawing was not changed meanwhile; otherwise, and with Reset
+ * Before Start, a new run (with a new backup) begins. While running, the Start
+ * button is Stop.
+ */
+async function toggleStart(wb: Workbench): Promise<void> {
+    if (wb.run?.running) {
+        wb.run.stop();
+        return;
+    }
+    await withBusy(wb, async () => {
+        try {
+            const resumed = wb.settings.resetBeforeStart ? undefined : continuableRun(wb);
+            let run = resumed;
+            if (run) {
+                await wb.session.run(async () => clearIndicatorsNow(wb.session.api, wb.indicators));
+            } else {
+                wb.runStatus = "Preparing...";
+                updateProgress(wb);
+                run = await createRun(wb, wb.settings.resetBeforeStart);
+                if (!run) return;
+                wb.run = run;
+            }
+            wb.runStatus = "Running";
+            wb.notify(resumed ? `Layout run continued at ${runSummary(run)}.` : "Layout run started.");
+            // `run` marks itself running synchronously, so this render already shows Stop.
+            const running = run.run(runHooks(wb, run));
+            wb.render();
+            const outcome = await running;
+            if (!wb.session.alive) return;
+            wb.runStatus = outcome === "completed" ? "Completed" : `Stopped at ${runSummary(run)}`;
+            wb.notify(outcome === "completed" ? "Layout run completed." : `Layout run stopped at ${runSummary(run)}.`);
+        } catch (error) {
+            wb.run?.stop();
+            wb.runStatus = "Failed";
+            reportError(wb, "The layout run failed.", error);
+        }
+    });
+}
+
+/** Step: one algorithm step of the stopped run, or of a new run on the current layout. */
+async function stepOnce(wb: Workbench): Promise<void> {
+    await withBusy(wb, async () => {
+        try {
+            let run = continuableRun(wb);
+            if (run) {
+                await wb.session.run(async () => clearIndicatorsNow(wb.session.api, wb.indicators));
+            } else {
+                run = await createRun(wb, false);
+                if (!run) return;
+                wb.run = run;
+            }
+            await run.step(runHooks(wb, run));
+            wb.runStatus = run.completed ? "Completed" : `Paused at ${runSummary(run)}`;
+        } catch (error) {
+            wb.runStatus = "Failed";
+            reportError(wb, "The layout step failed.", error);
+        }
+    });
+}
+
+/**
+ * Reset: replaces the layout with the initial layout (radial area weighted,
+ * then rotated and fitted to the border area). The next Start optimizes it.
+ */
+async function resetLayout(wb: Workbench): Promise<void> {
+    await withBusy(wb, async () => {
+        try {
+            if (!await createRunBackup(wb)) return;
+            const mindmap = loadMindmap(wb);
+            if (!mindmap) {
+                wb.notify("Configure a Border and a Root and parse the mindmap first.");
+                return;
+            }
+            applyInitialLayout(mindmap.graph, wb.settings);
+            delete wb.run;
+            await wb.session.run(() => writeGraphToScene(wb.ea, mindmap));
+            wb.runStatus = "Initial layout applied";
+            wb.notify("Initial layout applied (radial, area weighted).");
+        } catch (error) {
+            wb.runStatus = "Failed";
+            reportError(wb, "Could not apply the initial layout.", error);
+        }
+    });
+}
+
+function updateProgress(wb: Workbench): void {
+    const elements = wb.progressEls;
+    if (!elements || !wb.session.alive) return;
+    const algorithm = wb.run?.algorithm;
+    elements.steps.textContent = algorithm
+        ? `Current Step / Total Steps: ${algorithm.currentIteration} / ${algorithm.iterations} (${algorithm.phase})`
+        : "Current Step / Total Steps: - / -";
+    elements.timings.textContent = `Milliseconds Per Step: ${algorithm ? stepTimings(algorithm) : "Now - | Min - | Average - | Max -"}`;
+    elements.status.textContent = algorithm
+        ? `Status: ${wb.runStatus} | Gap ${algorithm.getGap().toFixed(1)} | Step Length ${algorithm.getStepLength().toFixed(2)} | Max Move ${algorithm.lastMaxMove.toFixed(2)} | Anchor Repairs ${algorithm.anchorRepairs}`
+        : `Status: ${wb.runStatus}`;
+    if (wb.statsEl) wb.statsEl.innerHTML = statsHtml(wb);
+}
+
+// BACKUPS
+
+/**
+ * Restores a backup by closing every view of the drawing, writing the file,
+ * and reopening it in the original leaf. The workbench ends, because its EA is
+ * destroyed together with the closed view.
+ */
+async function rollback(wb: Workbench, backup: MindmapBackup): Promise<void> {
     const { app, file } = wb.session;
     const leaf = wb.session.view.leaf;
     const notify = wb.notify;
     let closedLeaves: WorkspaceLeaf[] = [];
     try {
         await wb.session.run(async () => undefined);
-        const restored = await rollbackLatestMindmapBackup(app, file, {
+        const restored = await rollbackMindmapBackup(app, file, backup, {
             beforeWrite: async () => {
                 wb.session.teardown("rollback");
                 closedLeaves = await closeViewsOfFile(app, file);
@@ -472,12 +769,88 @@ async function rollback(wb: Workbench): Promise<void> {
                 await leaf.openFile(file, { active: true });
             },
         });
-        notify(restored ? "Mindmap backup restored. Run the script again to continue." : "No backup found for this drawing.");
+        notify(restored
+            ? `Mindmap backup ${backup.file.name} restored. Run the script again to continue.`
+            : "The selected backup no longer exists.");
     } catch (error) {
         console.error("[Automatic Mindmap Layouting] Could not restore the mindmap backup.", error);
         notify("Could not restore the mindmap backup. The backup file was kept.");
     }
 }
+
+const ROLLBACK_NOTE = "The drawing is closed, restored, and reopened; the workbench closes and must be started again.";
+
+/**
+ * Rollback dialog: shows the newest backup (file name and creation time) and
+ * offers to restore it or to choose a previous one.
+ */
+function openRollbackDialog(wb: Workbench): void {
+    const { app, file } = wb.session;
+    const backups = listMindmapBackups(app, file);
+    const newest = backups[0];
+    if (!newest) {
+        wb.notify("No backup found for this drawing.");
+        return;
+    }
+    const modal = new wb.ea.obsidian.Modal(app);
+    wb.childModals.add(modal);
+    const restore = (backup: MindmapBackup): void => {
+        modal.close();
+        void rollback(wb, backup);
+    };
+    const showNewest = (): void => {
+        const content = modal.contentEl;
+        content.empty();
+        modal.titleEl.textContent = "Rollback";
+        addText(content, "Restore the newest backup of this drawing?");
+        addPlainText(content, `Backup: ${newest.file.name}`);
+        addPlainText(content, `Created: ${backupCreatedAt(newest)}`);
+        addText(content, ROLLBACK_NOTE);
+        const actions = addActions(content);
+        addButton(actions, "Restore").addEventListener("click", () => restore(newest));
+        const previous = addButton(actions, "Choose Previous Backup");
+        previous.disabled = backups.length < 2;
+        previous.addEventListener("click", showPrevious);
+        addButton(actions, "Cancel").addEventListener("click", () => modal.close());
+    };
+    const showPrevious = (): void => {
+        const content = modal.contentEl;
+        content.empty();
+        modal.titleEl.textContent = "Rollback to a Previous Backup";
+        addText(content, "Choose the backup to restore. Only the chosen backup is consumed; newer backups are kept.");
+        const select = addSelect(content, backups.slice(1).map((backup) => ({
+            value: backup.file.path,
+            label: `${backup.file.name} (${backupCreatedAt(backup)})`,
+        })));
+        addText(content, ROLLBACK_NOTE);
+        const actions = addActions(content);
+        addButton(actions, "Restore").addEventListener("click", () => {
+            const chosen = backups.find((backup) => backup.file.path === select.value);
+            if (chosen) restore(chosen);
+        });
+        addButton(actions, "Back").addEventListener("click", showNewest);
+        addButton(actions, "Cancel").addEventListener("click", () => modal.close());
+    };
+    modal.onOpen = showNewest;
+    modal.onClose = () => wb.childModals.delete(modal);
+    modal.open();
+}
+
+function confirmClearBackups(wb: Workbench): void {
+    const { app, file } = wb.session;
+    const count = listMindmapBackups(app, file).length;
+    confirmAction(wb.ea, `Delete all ${plural(count, "backup")} of this drawing?`, async () => {
+        try {
+            const deleted = await clearMindmapBackups(app, file);
+            wb.notify(`${plural(deleted, "mindmap backup")} deleted.`);
+        } catch (error) {
+            reportError(wb, "Could not clear the mindmap backups.", error);
+        }
+        if (wb.session.alive) wb.render();
+    });
+}
+
+// BORDER SETTINGS
 
 async function saveBorder(wb: Workbench, candidateId: string, padding: MindmapPadding): Promise<void> {
     await wb.session.run(async () => {
@@ -501,7 +874,7 @@ function renderBorderSettings(wb: Workbench, modal: InstanceType<ExcalidrawAutom
     let candidateId = wb.state.borderId;
     const nextPadding: MindmapPadding = { ...wb.state.padding };
     wb.borderPreview = { ...(candidateId ? { borderId: candidateId } : {}), padding: nextPadding };
-    const candidateText = addText(content, `Border Element: ${logicalLabel(resolveAnchorId(wb.ea, candidateId, scene))}`);
+    const candidateText = addPlainText(content, `Border Element: ${logicalLabel(resolveAnchorId(wb.ea, candidateId, scene))}`);
     const schedulePreview = (): void => {
         if (timer.id !== undefined) window.clearTimeout(timer.id);
         timer.id = window.setTimeout(() => void refresh(wb), DEBOUNCE_MS);
@@ -522,13 +895,9 @@ function renderBorderSettings(wb: Workbench, modal: InstanceType<ExcalidrawAutom
         addRangePair(content, label, -120, 120, nextPadding[side], (value) => {
             nextPadding[side] = value;
             schedulePreview();
-        }, "5em");
+        }, { minLabelWidth: "5em" });
     }
-    const actions = content.ownerDocument.createElement("div");
-    actions.style.display = "flex";
-    actions.style.justifyContent = "flex-end";
-    actions.style.gap = "0.5em";
-    actions.style.marginTop = "0.5em";
+    const actions = addActions(content);
     addButton(actions, "Save").addEventListener("click", () => {
         if (!candidateId) return;
         void saveBorder(wb, candidateId, nextPadding)
@@ -537,7 +906,6 @@ function renderBorderSettings(wb: Workbench, modal: InstanceType<ExcalidrawAutom
             .then(() => modal.close());
     });
     addButton(actions, "Cancel").addEventListener("click", () => modal.close());
-    content.appendChild(actions);
 }
 
 function createBorderModal(wb: Workbench): void {
@@ -558,26 +926,27 @@ function createBorderModal(wb: Workbench): void {
     modal.open();
 }
 
+// MAIN MODAL
+
 function renderDataSection(wb: Workbench, content: HTMLElement): void {
     const { ea, state } = wb;
     const data = addSection(content, "Mindmap Data");
     const scene = ea.getViewElements();
-    addText(data, `Border Element: ${logicalLabel(resolveAnchorId(ea, state.borderId, scene))}`);
+    addPlainText(data, `Border Element: ${logicalLabel(resolveAnchorId(ea, state.borderId, scene))}`);
     addButton(data, "Configure Border").addEventListener("click", () => createBorderModal(wb));
     addSpacer(data, "0.5em");
     const root = resolveAnchorId(ea, state.rootId, scene);
-    addText(data, `Root Element: ${logicalLabel(root)}`);
+    addPlainText(data, `Root Element: ${logicalLabel(root)}`);
     addButton(data, "Select Root Element/Group").addEventListener("click", () => void selectRoot(wb));
     addSpacer(data, "0.5em");
-    const shapeSelect = data.ownerDocument.createElement("select");
-    for (const shape of ["ellipse", "rect"] as const) {
-        const option = data.ownerDocument.createElement("option");
-        option.value = shape;
-        option.textContent = shape;
-        shapeSelect.appendChild(option);
-    }
-    data.appendChild(shapeSelect);
+    const shapeSelect = addSelect(data, [{ value: "ellipse", label: "ellipse" }, { value: "rect", label: "rect" }]);
     addButton(data, "Apply Shape To Selection").addEventListener("click", () => void applyShape(wb, shapeSelect.value));
+    addSpacer(data, "0.5em");
+    addText(data, `Fixed Nodes: ${wb.fixedIds.length}`);
+    const fixedActions = addRow(data, "1fr 1fr");
+    addButton(fixedActions, "Fix Selection").addEventListener("click", () => void setSelectionFixed(wb, true));
+    addButton(fixedActions, "Unfix Selection").addEventListener("click", () => void setSelectionFixed(wb, false));
+    addButton(data, "Fit Selected Text Widths").addEventListener("click", () => void fitSelectedTextWidths(wb));
     addSpacer(data, "0.5em");
     addRangePair(data, "Connection Distance", 1, 300, state.connectionDistance, (value) => saveConnectionDistance(wb, value));
     const parse = addButton(data, "Parse Mindmap");
@@ -593,66 +962,121 @@ function renderDataSection(wb: Workbench, content: HTMLElement): void {
     clearMindmap.addEventListener("click", () => confirmAction(ea, "Clear All Mindmap Node and Edge Metadata?", () => clearMindmapMetadata(wb, false)));
     clearAll.disabled = !scene.some((element) => ALL_KEYS.some((key) => customData(element)[key] !== undefined));
     clearAll.addEventListener("click", () => confirmAction(ea, "Clear All Mindmap Metadata?", () => clearMindmapMetadata(wb, true)));
+    if (wb.busy) disableControls(data);
 }
 
-function renderAlgorithmSection(content: HTMLElement): void {
-    const algorithm = addSection(content, "Algorithm");
-    const algorithmSelect = content.ownerDocument.createElement("select");
-    const defaultOption = content.ownerDocument.createElement("option");
-    defaultOption.value = "default";
-    defaultOption.textContent = "Default";
-    algorithmSelect.appendChild(defaultOption);
-    algorithm.appendChild(algorithmSelect);
-    addSpacer(algorithm, "0.5em");
-    addRangePair(algorithm, "Steps Per Render", 1, 1000, 1, () => undefined);
-    addSpacer(algorithm, "0.5em");
-    addText(algorithm, "Algorithm-Specific Options: Reserved");
+function addParameterControl(wb: Workbench, parent: HTMLElement, parameter: Parameter): void {
+    const update = (value: number | boolean): void => {
+        wb.settings.values[parameter.key] = value;
+        invalidateRun(wb);
+    };
+    if (isBooleanParameter(parameter)) {
+        addCheckbox(parent, parameter.label, Boolean(wb.settings.values[parameter.key]), update);
+        return;
+    }
+    addRangePair(parent, parameter.label, parameter.min, parameter.max, Number(wb.settings.values[parameter.key]), update, {
+        step: parameter.step,
+        minLabelWidth: LABEL_WIDTH,
+    });
+}
+
+function renderAlgorithmSection(wb: Workbench, content: HTMLElement): void {
+    const section = addSection(content, "Algorithm");
+    const options = Object.entries(ALGORITHM_OPTIONS).map(([value, label]) => ({ value, label }));
+    const select = addSelect(section, options, wb.settings.algorithm);
+    select.addEventListener("change", () => {
+        wb.settings.algorithm = select.value as AlgorithmId;
+        invalidateRun(wb);
+    });
+    addSpacer(section, "0.5em");
+    addRangePair(section, "Steps Per Render", 1, STEPS_FINISHED, wb.settings.stepsPerRender, (value) => {
+        wb.settings.stepsPerRender = value;
+        updateControls(wb);
+    }, { minLabelWidth: LABEL_WIDTH, maximumLabel: "Finished" });
+    addSpacer(section, "0.5em");
+    for (const parameter of PRIMARY_PARAMETERS) addParameterControl(wb, section, parameter);
+    const details = content.ownerDocument.createElement("details");
+    details.open = wb.settings.showAdvanced;
+    details.addEventListener("toggle", () => {
+        wb.settings.showAdvanced = details.open;
+    });
+    const summary = content.ownerDocument.createElement("summary");
+    summary.textContent = "Advanced Parameters";
+    details.appendChild(summary);
+    const advanced = content.ownerDocument.createElement("div");
+    advanced.style.display = "flex";
+    advanced.style.flexDirection = "column";
+    advanced.style.gap = "0.45em";
+    advanced.style.marginTop = "0.45em";
+    for (const parameter of [...ADVANCED_PARAMETERS, ...INITIAL_LAYOUT_PARAMETERS]) addParameterControl(wb, advanced, parameter);
+    details.appendChild(advanced);
+    section.appendChild(details);
+    addSpacer(section, "0.5em");
+    addButton(section, "Restore Algorithm Defaults").addEventListener("click", () => {
+        restoreSettings(wb, toStoredSettings(defaultAlgorithmSettings()), "Algorithm defaults restored.");
+    });
+    const restoreStored = addButton(section, "Restore Mindmap Parameters");
+    restoreStored.addEventListener("click", () => {
+        if (wb.storedSettings) restoreSettings(wb, wb.storedSettings, "Mindmap parameters restored from the root element.");
+    });
+    const save = addButton(section, "Save Mindmap Parameters");
+    save.addEventListener("click", () => void saveMindmapParameters(wb));
+    wb.controls = { ...wb.controls, restoreStored, save };
 }
 
 function renderControlSection(wb: Workbench, content: HTMLElement): void {
-    const { ea, session } = wb;
+    const { session } = wb;
     const control = addSection(content, "Control");
-    const firstRow = addRow(control, "auto auto auto");
-    const secondRow = addRow(control, "auto auto");
-    addButton(firstRow, "Start").addEventListener("click", () => void startRun(wb));
-    for (const label of ["Step", "Reset"]) addButton(firstRow, label).disabled = true;
+    const firstRow = addRow(control, "1fr 1fr 1fr");
+    const secondRow = addRow(control, "1fr 1fr");
+    const running = Boolean(wb.run?.running);
+    const ready = graphReady(wb);
+    const start = addButton(firstRow, startLabel(wb));
+    start.disabled = running ? false : wb.busy || !ready;
+    start.addEventListener("click", () => void toggleStart(wb));
+    wb.controls = { ...wb.controls, start };
+    const step = addButton(firstRow, "Step");
+    step.disabled = wb.busy || !ready;
+    step.addEventListener("click", () => void stepOnce(wb));
+    const reset = addButton(firstRow, "Reset");
+    reset.disabled = wb.busy || !ready;
+    reset.addEventListener("click", () => void resetLayout(wb));
     const hasBackups = listMindmapBackups(session.app, session.file).length > 0;
     const rollbackButton = addButton(secondRow, "Rollback");
-    rollbackButton.disabled = !hasBackups;
-    rollbackButton.addEventListener("click", () => confirmAction(
-        ea,
-        "Restore the newest backup for this drawing? The drawing is closed, restored, and reopened; the workbench closes and must be started again.",
-        () => rollback(wb),
-    ));
+    rollbackButton.disabled = wb.busy || !hasBackups;
+    rollbackButton.addEventListener("click", () => openRollbackDialog(wb));
     const clearBackups = addButton(secondRow, "Clear Backups");
-    clearBackups.disabled = !hasBackups;
-    clearBackups.addEventListener("click", () => confirmAction(ea, "Delete all backups for this drawing?", async () => {
-        try {
-            await clearMindmapBackups(session.app, session.file);
-            wb.notify("Mindmap backups cleared.");
-        } catch (error) {
-            reportError(wb, "Could not clear the mindmap backups.", error);
-        }
-        if (session.alive) wb.render();
-    }));
+    clearBackups.disabled = wb.busy || !hasBackups;
+    clearBackups.addEventListener("click", () => confirmClearBackups(wb));
+    addCheckbox(control, "Reset Before Start", wb.settings.resetBeforeStart, (value) => {
+        wb.settings.resetBeforeStart = value;
+        updateControls(wb);
+    });
     addSpacer(control, "0.5em");
-    addText(control, "Current Step / Total Steps: - / -");
-    addText(control, "Milliseconds Per Step: Now - | Min - | Average - | Max -");
+    wb.progressEls = {
+        steps: addText(control, ""),
+        timings: addText(control, ""),
+        status: addText(control, ""),
+    };
+    updateProgress(wb);
 }
 
 function renderMain(wb: Workbench, modal: InstanceType<ExcalidrawAutomate["FloatingModal"]>): void {
     if (!wb.session.alive) return;
     const content = modal.contentEl;
     content.empty();
-    styleModalContent(content, modal.modalEl, "28em");
+    styleModalContent(content, modal.modalEl, "30em");
     renderDataSection(wb, content);
-    renderAlgorithmSection(content);
+    renderAlgorithmSection(wb, content);
     renderControlSection(wb, content);
     addCredit(content);
     wb.presence = presenceKey(wb);
+    updateControls(wb);
 }
 
 function handleTeardown(wb: Workbench, modal: { close: () => void }, reason: TeardownReason): void {
+    // Stop first: the run checks the flag before its next step and render.
+    wb.run?.stop();
     if (wb.connectionTimer !== undefined) window.clearTimeout(wb.connectionTimer);
     for (const child of [...wb.childModals]) child.close();
     wb.childModals.clear();
@@ -696,12 +1120,18 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
         state: loadRuntimeState(ea.getViewElements()),
         indicators: createIndicatorState(),
         nodes: [],
+        fixedIds: [],
         childModals: new Set(),
         presence: "",
+        settings: defaultAlgorithmSettings(),
+        busy: false,
+        runStatus: "Idle",
         notify,
         render: () => renderMain(wb, modal),
     };
     holder.workbench = wb;
+    wb.storedSettings = readRootSettings(wb);
+    if (wb.storedSettings) wb.settings = applyStoredSettings(wb.settings, wb.storedSettings);
     modal.titleEl.textContent = "Automatic Mindmap Layouting";
     modal.onOpen = () => {
         wb.render();
