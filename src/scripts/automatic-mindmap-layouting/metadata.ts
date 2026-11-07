@@ -1,6 +1,7 @@
-import type { TreeGraph } from "./core/graph/types";
+import type { ParsedMindmap } from "./parser";
 
 export type MindmapShape = "ellipse" | "rectangle";
+export type LineEnd = "start" | "end";
 
 export interface MindmapPadding {
     top: number;
@@ -15,8 +16,19 @@ export interface MindmapRuntimeState {
     rootId?: string;
     rootShape: MindmapShape;
     connectionDistance: number;
-    graph?: TreeGraph;
+    mindmap?: ParsedMindmap;
 }
+
+/** Persistent `mindmapEdge` value on the line element that draws an edge. */
+export type MindmapEdgeMetadata = {
+    parentId: string;
+    childId: string;
+    parentEnd: LineEnd;
+    parentOffset: { x: number; y: number };
+    childOffset: { x: number; y: number };
+    parentGap: number;
+    childGap: number;
+};
 
 export const DEFAULT_PADDING: MindmapPadding = {
     top: 90,
@@ -25,10 +37,12 @@ export const DEFAULT_PADDING: MindmapPadding = {
     right: 100,
 };
 
+export const DEFAULT_CONNECTION_DISTANCE = 15;
+
 export const DEFAULT_RUNTIME_STATE: MindmapRuntimeState = {
     padding: DEFAULT_PADDING,
     rootShape: "ellipse",
-    connectionDistance: 15,
+    connectionDistance: DEFAULT_CONNECTION_DISTANCE,
 };
 
 /**
@@ -103,10 +117,10 @@ export function readPadding(value: Record<string, unknown> | undefined): Mindmap
     if (!padding || typeof padding !== "object") return { ...DEFAULT_PADDING };
     const candidate = padding as Record<string, unknown>;
     return {
-        top: clampInteger(candidate.top, -120, 120, 0),
-        left: clampInteger(candidate.left, -120, 120, 0),
-        bottom: clampInteger(candidate.bottom, -120, 120, 0),
-        right: clampInteger(candidate.right, -120, 120, 0),
+        top: clampInteger(candidate.top, -120, 120, DEFAULT_PADDING.top),
+        left: clampInteger(candidate.left, -120, 120, DEFAULT_PADDING.left),
+        bottom: clampInteger(candidate.bottom, -120, 120, DEFAULT_PADDING.bottom),
+        right: clampInteger(candidate.right, -120, 120, DEFAULT_PADDING.right),
     };
 }
 
@@ -133,11 +147,39 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
                     getCustomDataValue(customData, "mindmapConnectionDistance"),
                     1,
                     300,
-                    50,
+                    DEFAULT_CONNECTION_DISTANCE,
                 );
             }
         }
     }
 
     return state;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+    return typeof value === "number" && Number.isFinite(value);
+}
+
+function readVector(value: unknown): { x: number; y: number } | undefined {
+    const candidate = value as { x?: unknown; y?: unknown } | null | undefined;
+    return isFiniteNumber(candidate?.x) && isFiniteNumber(candidate?.y) ? { x: candidate.x, y: candidate.y } : undefined;
+}
+
+/**
+ * Reads and validates the edge metadata of a line element.
+ *
+ * @param element Scene element.
+ * @returns The metadata, or undefined when the element tracks no valid edge.
+ */
+export function readEdgeMetadata(element: ExcalidrawElement): MindmapEdgeMetadata | undefined {
+    const data = element.customData as Record<string, unknown> | undefined;
+    if (data?.isMindmapEdge !== true) return undefined;
+    const edge = data.mindmapEdge as Partial<Record<keyof MindmapEdgeMetadata, unknown>> | undefined;
+    const parentOffset = readVector(edge?.parentOffset);
+    const childOffset = readVector(edge?.childOffset);
+    if (!edge || !parentOffset || !childOffset) return undefined;
+    const { parentId, childId, parentEnd, parentGap, childGap } = edge;
+    if (typeof parentId !== "string" || typeof childId !== "string") return undefined;
+    if ((parentEnd !== "start" && parentEnd !== "end") || !isFiniteNumber(parentGap) || !isFiniteNumber(childGap)) return undefined;
+    return { parentId, childId, parentEnd, parentOffset, childOffset, parentGap, childGap };
 }

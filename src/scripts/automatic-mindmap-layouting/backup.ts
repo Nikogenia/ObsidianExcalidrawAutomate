@@ -81,8 +81,53 @@ export interface RollbackHooks {
      * Must close every open editor of the file (see `closeViewsOfFile`).
      */
     beforeWrite: () => Promise<void>;
-    /** Runs after the drawing file was written, typically to reopen it. */
+    /** Runs after the write attempt, also a failed one, typically to reopen the drawing. */
     afterWrite: () => Promise<void>;
+}
+
+/** Longer than the plugin's 200 ms deferred final save plus the time the write takes. */
+const FILE_QUIET_MS = 750;
+const FILE_QUIET_LIMIT_MS = 5000;
+const RESTORE_ATTEMPTS = 3;
+
+/**
+ * Resolves once `file` was not modified for `FILE_QUIET_MS` (at most `FILE_QUIET_LIMIT_MS`).
+ *
+ * A closing Excalidraw view does not write its final save immediately:
+ * `performSave` schedules `vault.modify` with a 200 ms timeout while
+ * `semaphores.viewunload` is set, and that timer outlives the awaited
+ * `View.close()`. Writing the backup before it fired lets it overwrite the
+ * restored file.
+ */
+function waitForFileQuiet(app: App, file: TFile): Promise<void> {
+    return new Promise((resolve) => {
+        let quietTimer: ReturnType<typeof setTimeout> | undefined;
+        const finish = (): void => {
+            if (quietTimer !== undefined) clearTimeout(quietTimer);
+            clearTimeout(limitTimer);
+            app.vault.offref(modifyRef);
+            resolve();
+        };
+        const restartQuietTimer = (): void => {
+            if (quietTimer !== undefined) clearTimeout(quietTimer);
+            quietTimer = setTimeout(finish, FILE_QUIET_MS);
+        };
+        const limitTimer = setTimeout(finish, FILE_QUIET_LIMIT_MS);
+        const modifyRef = app.vault.on("modify", (changed) => {
+            if (changed.path === file.path) restartQuietTimer();
+        });
+        restartQuietTimer();
+    });
+}
+
+/** Writes `content` and verifies it is still there after the file went quiet. */
+async function writeAndVerify(app: App, file: TFile, content: string): Promise<void> {
+    for (let attempt = 0; attempt < RESTORE_ATTEMPTS; attempt++) {
+        await app.vault.modify(file, content);
+        await waitForFileQuiet(app, file);
+        if (await app.vault.read(file) === content) return;
+    }
+    throw new Error(`"${file.path}" kept being overwritten while restoring the backup.`);
 }
 
 /**
@@ -94,8 +139,8 @@ export interface RollbackHooks {
  * `synchronizeWithData`, a merge that keeps whichever element has the higher
  * `version`. Backup elements are older, so the live scene wins, and the dirty
  * view then autosaves the merged scene over the restored file.
- * `setViewState` awaits `View.close()`, i.e. the view's final save and the
- * destruction of its script EA instances, before resolving.
+ * `setViewState` awaits `View.close()`, which schedules the view's final save
+ * (see `waitForFileQuiet`) and destroys its script EA instances.
  */
 export async function closeViewsOfFile(app: App, file: TFile): Promise<WorkspaceLeaf[]> {
     const leaves: WorkspaceLeaf[] = [];
@@ -111,8 +156,10 @@ export async function closeViewsOfFile(app: App, file: TFile): Promise<Workspace
  * Restores and then consumes the newest backup for the drawing.
  *
  * The backup is read before anything is changed and deleted only after the
- * drawing was written and reopened, so a failure never loses the only
- * recoverable copy.
+ * restored content was verified and the drawing reopened, so a failure never
+ * loses the only recoverable copy. No editor is open between closing and
+ * reopening, so verifying the file there cannot mistake a legitimate save of the
+ * reopened view for an overwrite.
  */
 export async function rollbackLatestMindmapBackup(
     app: App,
@@ -123,8 +170,12 @@ export async function rollbackLatestMindmapBackup(
     if (!backup) return false;
     const content = await app.vault.read(backup.file);
     await hooks.beforeWrite();
-    await app.vault.modify(file, content);
-    await hooks.afterWrite();
+    await waitForFileQuiet(app, file);
+    try {
+        await writeAndVerify(app, file, content);
+    } finally {
+        await hooks.afterWrite();
+    }
     await app.vault.delete(backup.file);
     const folder = emptyBackupFolder(app, backupFolderPath(file));
     if (folder) {

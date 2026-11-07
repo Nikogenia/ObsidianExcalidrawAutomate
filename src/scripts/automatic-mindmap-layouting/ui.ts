@@ -9,6 +9,8 @@ import {
 } from "./indicators";
 import {
     clampInteger,
+    DEFAULT_CONNECTION_DISTANCE,
+    DEFAULT_PADDING,
     loadRuntimeState,
     normalizeShape,
     shapeOf,
@@ -17,7 +19,8 @@ import {
 } from "./metadata";
 import { normalizeBoundText, resolveAnchor, resolveAnchorId, resolveLogicalSelection, type LogicalElement } from "./groups";
 import { loadMindmapFromMetadata, parseMindmap } from "./parser";
-import { calculateGraphMetricsString } from "./core/graph/evaluation";
+import { edgeMetadata } from "./edges";
+import { calculateTreeEdgeGraphMetricsString } from "./core/graph/evaluationEdge";
 import {
     clearMindmapBackups,
     closeViewsOfFile,
@@ -29,6 +32,7 @@ import { saveCurrentDrawing, saveMetadata, type MetadataPatch } from "./scene";
 import { WorkbenchSession, type TeardownReason } from "./session";
 
 type Notify = (message: string) => void;
+type WorkspaceLeaf = WorkbenchSession["view"]["leaf"];
 
 /** Runtime state of one open workbench. */
 interface Workbench {
@@ -48,7 +52,7 @@ interface Workbench {
     render: () => void;
 }
 
-const NODE_KEYS = ["isMindmapNode", "mindmapParent", "mindmapChildren"];
+const NODE_KEYS = ["isMindmapNode", "mindmapParent", "mindmapChildren", "isMindmapEdge", "mindmapEdge"];
 const ALL_KEYS = ["isMindmapBorder", "mindmapPadding", "isMindmapRoot", "mindmapShape", "mindmapConnectionDistance", ...NODE_KEYS];
 const DEBOUNCE_MS = 120;
 
@@ -245,12 +249,12 @@ function hydrate(wb: Workbench): void {
     const border = resolveAnchorId(wb.ea, wb.state.borderId, scene);
     const root = resolveAnchorId(wb.ea, wb.state.rootId, scene);
     if (!border || !root) {
-        delete wb.state.graph;
+        delete wb.state.mindmap;
         wb.nodes = [];
         return;
     }
     const loaded = loadMindmapFromMetadata(wb.ea, root, border, wb.state.padding);
-    wb.state.graph = loaded.graph;
+    wb.state.mindmap = loaded;
     wb.nodes = loaded.nodes.slice(1).map((logical) => {
         const node = loaded.graph.getNode(logical.anchor.id);
         return {
@@ -264,12 +268,12 @@ function hydrate(wb: Workbench): void {
 function presenceKey(wb: Workbench): string {
     const scene = wb.ea.getViewElements();
     const has = (id: string | undefined): boolean => Boolean(id && scene.some((element) => element.id === id));
-    return JSON.stringify([has(wb.state.borderId), has(wb.state.rootId), Boolean(wb.state.graph), scene.some(isNode)]);
+    return JSON.stringify([has(wb.state.borderId), has(wb.state.rootId), Boolean(wb.state.mindmap), scene.some(isNode)]);
 }
 
 function statsHtml(wb: Workbench): string {
-    return wb.state.graph
-        ? `Graph Statistics:<br>${calculateGraphMetricsString(wb.state.graph).replace(/\n/g, "<br>")}`
+    return wb.state.mindmap
+        ? `Graph Statistics:<br>${calculateTreeEdgeGraphMetricsString(wb.state.mindmap.graph).replace(/\n/g, "<br>")}`
         : "Graph Statistics: Available after parsing";
 }
 
@@ -305,9 +309,18 @@ async function repairRootFlags(wb: Workbench): Promise<void> {
 
 function parsePatches(wb: Workbench, parsed: ReturnType<typeof parseMindmap>): MetadataPatch[] {
     const parsedIds = new Set(parsed.nodes.map((node) => node.anchor.id));
-    const stale = wb.ea.getViewElements()
+    const parsedLineIds = new Set([...parsed.edges.values()].map((binding) => binding.lineId));
+    const scene = wb.ea.getViewElements();
+    const stale = scene
         .filter((element) => isNode(element) && !parsedIds.has(element.id) && element.id !== wb.state.rootId)
         .map((element) => ({ id: element.id, patch: { isMindmapNode: undefined, mindmapParent: undefined, mindmapChildren: undefined } }));
+    const staleLines = scene
+        .filter((element) => customData(element).isMindmapEdge === true && !parsedLineIds.has(element.id))
+        .map((element) => ({ id: element.id, patch: { isMindmapEdge: undefined, mindmapEdge: undefined } }));
+    const lines = [...parsed.edges.values()].map((binding) => ({
+        id: binding.lineId,
+        patch: { isMindmapEdge: true, mindmapEdge: edgeMetadata(parsed.graph.getEdge(binding.childId)!, binding) },
+    }));
     const nodes = parsed.nodes.map((node) => {
         const graphNode = parsed.graph.getNode(node.anchor.id)!;
         return {
@@ -320,7 +333,7 @@ function parsePatches(wb: Workbench, parsed: ReturnType<typeof parseMindmap>): M
             },
         };
     });
-    return [...stale, ...nodes];
+    return [...stale, ...staleLines, ...nodes, ...lines];
 }
 
 /** Parses from the configured root, persists the result, and refreshes indicators. */
@@ -333,12 +346,11 @@ async function parseCurrentMindmap(wb: Workbench): Promise<void> {
             const border = resolveAnchorId(ea, state.borderId, scene);
             if (!root) return wb.notify("Select a Root Element before parsing.");
             if (!border) return wb.notify("Configure a Border before parsing.");
-            wb.notify("Parsing Mindmap... This may take a moment for large mindmaps.");
             const parsed = parseMindmap(ea, root, state.connectionDistance, border, state.padding);
             await saveMetadata(ea, parsePatches(wb, parsed));
             hydrate(wb);
             await syncIndicators(ea, wb.indicators, indicatorModel(wb));
-            return undefined;
+            return wb.notify(`Mindmap parsed: ${parsed.nodes.length} nodes, ${parsed.edges.size} edges.`);
         });
     } catch (error) {
         reportError(wb, "Could not parse the mindmap.", error);
@@ -372,6 +384,7 @@ async function selectRoot(wb: Workbench): Promise<void> {
         wb.state.rootId = selected.anchor.id;
         wb.state.rootShape = shape;
     });
+    wb.notify("Root Element saved.");
     await parseCurrentMindmap(wb);
 }
 
@@ -387,6 +400,7 @@ async function applyShape(wb: Workbench, value: string): Promise<void> {
         if (anchors.some((element) => element.id === wb.state.rootId)) wb.state.rootShape = shape;
     });
     await refresh(wb);
+    wb.notify(`Shape "${shape}" applied to ${anchors.length} node${anchors.length === 1 ? "" : "s"}.`);
 }
 
 function saveConnectionDistance(wb: Workbench, value: number): void {
@@ -409,10 +423,13 @@ async function clearMindmapMetadata(wb: Workbench, clearAll: boolean): Promise<v
         if (clearAll) {
             delete wb.state.borderId;
             delete wb.state.rootId;
+            wb.state.padding = { ...DEFAULT_PADDING };
+            wb.state.connectionDistance = DEFAULT_CONNECTION_DISTANCE;
         }
     });
     await refresh(wb);
     if (wb.session.alive) wb.render();
+    wb.notify(clearAll ? "All mindmap metadata cleared." : "Mindmap node and edge metadata cleared.");
 }
 
 async function startRun(wb: Workbench): Promise<void> {
@@ -440,14 +457,18 @@ async function rollback(wb: Workbench): Promise<void> {
     const { app, file } = wb.session;
     const leaf = wb.session.view.leaf;
     const notify = wb.notify;
+    let closedLeaves: WorkspaceLeaf[] = [];
     try {
         await wb.session.run(async () => undefined);
         const restored = await rollbackLatestMindmapBackup(app, file, {
             beforeWrite: async () => {
                 wb.session.teardown("rollback");
-                await closeViewsOfFile(app, file);
+                closedLeaves = await closeViewsOfFile(app, file);
             },
             afterWrite: async () => {
+                for (const other of closedLeaves) {
+                    if (other !== leaf) await other.openFile(file, { active: false });
+                }
                 await leaf.openFile(file, { active: true });
             },
         });
@@ -511,6 +532,7 @@ function renderBorderSettings(wb: Workbench, modal: InstanceType<ExcalidrawAutom
     addButton(actions, "Save").addEventListener("click", () => {
         if (!candidateId) return;
         void saveBorder(wb, candidateId, nextPadding)
+            .then(() => wb.notify("Border saved."))
             .catch((error: unknown) => reportError(wb, "Could not save the border.", error))
             .then(() => modal.close());
     });
@@ -568,7 +590,7 @@ function renderDataSection(wb: Workbench, content: HTMLElement): void {
     const clearMindmap = addButton(metadataActions, "Clear Mindmap");
     const clearAll = addButton(metadataActions, "Clear All Metadata");
     clearMindmap.disabled = !scene.some(isNode);
-    clearMindmap.addEventListener("click", () => confirmAction(ea, "Clear All Mindmap Node Metadata?", () => clearMindmapMetadata(wb, false)));
+    clearMindmap.addEventListener("click", () => confirmAction(ea, "Clear All Mindmap Node and Edge Metadata?", () => clearMindmapMetadata(wb, false)));
     clearAll.disabled = !scene.some((element) => ALL_KEYS.some((key) => customData(element)[key] !== undefined));
     clearAll.addEventListener("click", () => confirmAction(ea, "Clear All Mindmap Metadata?", () => clearMindmapMetadata(wb, true)));
 }
@@ -636,6 +658,7 @@ function handleTeardown(wb: Workbench, modal: { close: () => void }, reason: Tea
     wb.childModals.clear();
     if (reason !== "modal-close") modal.close();
     if (reason === "file-switch") wb.notify("Automatic Mindmap Layouting closed because another file was opened in this tab.");
+    if (reason === "replaced") wb.notify("Automatic Mindmap Layouting was already running; it has been restarted.");
 }
 
 /**

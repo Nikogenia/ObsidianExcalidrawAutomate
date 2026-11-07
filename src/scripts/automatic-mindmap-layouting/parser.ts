@@ -1,18 +1,20 @@
 import p5 from "p5";
-import { TreeGraph, type TreeNode } from "./core/graph/types";
-import { shapeOf, type MindmapPadding } from "./metadata";
+import { TreeEdgeGraph } from "./core/graph/TreeEdgeGraph";
+import type { TreeNode } from "./core/graph/types";
+import { readEdgeMetadata, shapeOf, type LineEnd, type MindmapPadding } from "./metadata";
 import { containerIdOf, resolveAnchor, type LogicalElement } from "./groups";
+import { bindLineToEdge, lineEndpoints, type EdgeBinding, type Point } from "./edges";
 
 export interface ParsedMindmap {
-    graph: TreeGraph;
+    graph: TreeEdgeGraph;
     nodes: LogicalElement[];
+    /** Line element of each edge, keyed by child ID like `TreeEdgeGraph.edges`. */
+    edges: Map<string, EdgeBinding>;
     coordinateSpace: CoordinateSpace;
 }
 
-interface Point {
-    x: number;
-    y: number;
-}
+/** Default anchor region, matching the default of `TreeEdgeGraph` and the Nikogenia algorithm. */
+const MAX_OFFSET_RATIO = 0.5;
 
 export interface CoordinateSpace {
     origin: Point;
@@ -59,18 +61,6 @@ function distanceToBoundary(point: Point, logical: LogicalElement): number {
     const distanceX = Math.max(Math.abs(dx) - logical.bounds.width / 2, 0);
     const distanceY = Math.max(Math.abs(dy) - logical.bounds.height / 2, 0);
     return Math.sqrt(distanceX * distanceX + distanceY * distanceY);
-}
-
-function linePoints(element: ExcalidrawElement): [Point, Point] | undefined {
-    if (element.type !== "line" && element.type !== "arrow") return undefined;
-    const points = (element as ExcalidrawElement & { points?: readonly [number, number][] }).points;
-    if (!points || points.length < 2) return undefined;
-    const first = points[0];
-    const last = points[points.length - 1];
-    return [
-        { x: element.x + first[0], y: element.y + first[1] },
-        { x: element.x + last[0], y: element.y + last[1] },
-    ];
 }
 
 function isLoop(candidateId: string, parentId: string, parentById: Map<string, string | undefined>): boolean {
@@ -167,11 +157,11 @@ export function loadMindmapFromMetadata(
     ea: ExcalidrawAutomate,
     root: LogicalElement,
     border: LogicalElement,
-    padding: MindmapPadding = { top: 0, left: 0, bottom: 0, right: 0 },
+    padding: MindmapPadding,
 ): ParsedMindmap {
     const scene = ea.getViewElements().filter((element) => customData(element).isMindmapTemporary !== true);
     const space = coordinateSpace(border, padding);
-    const graph = new TreeGraph("Mindmap", root.anchor.id, space.width, space.height);
+    const graph = new TreeEdgeGraph("Mindmap", root.anchor.id, space.width, space.height, MAX_OFFSET_RATIO);
     const nodes: LogicalElement[] = [root];
     const queued = new Set<string>([root.anchor.id]);
     const queue: LogicalElement[] = [root];
@@ -193,7 +183,35 @@ export function loadMindmapFromMetadata(
             graph.addNode(nodeFor(child, parent.anchor.id, space));
         }
     }
-    return { graph, nodes, coordinateSpace: space };
+    return { graph, nodes, edges: hydrateEdges(graph, scene), coordinateSpace: space };
+}
+
+/**
+ * Applies persisted line metadata to the graph's edges.
+ *
+ * Offsets come from metadata rather than the line's current geometry, because a
+ * node moved by hand must not turn the old line position into an anchor offset.
+ * If several lines claim one edge (for example a copied line), the first in scene
+ * order wins. An edge without a line stays centered and is simply not redrawn.
+ */
+function hydrateEdges(graph: TreeEdgeGraph, scene: readonly ExcalidrawElement[]): Map<string, EdgeBinding> {
+    const edges = new Map<string, EdgeBinding>();
+    for (const line of scene) {
+        const metadata = readEdgeMetadata(line);
+        const edge = metadata && graph.getEdge(metadata.childId);
+        if (!metadata || !edge || edge.parentId !== metadata.parentId || edges.has(metadata.childId) || !lineEndpoints(line)) continue;
+        graph.setOffset(edge, "parent", metadata.parentOffset.x, metadata.parentOffset.y);
+        graph.setOffset(edge, "child", metadata.childOffset.x, metadata.childOffset.y);
+        edges.set(metadata.childId, {
+            lineId: line.id,
+            parentId: metadata.parentId,
+            childId: metadata.childId,
+            parentEnd: metadata.parentEnd,
+            parentGap: metadata.parentGap,
+            childGap: metadata.childGap,
+        });
+    }
+    return edges;
 }
 
 /**
@@ -202,14 +220,14 @@ export function loadMindmapFromMetadata(
  * @param ea Active ExcalidrawAutomate instance.
  * @param root Configured root logical element.
  * @param connectionDistance Maximum endpoint-to-boundary distance.
- * @returns The parent-first graph and logical node representations.
+ * @returns The parent-first graph, logical node representations, and the line of each edge.
  */
 export function parseMindmap(
     ea: ExcalidrawAutomate,
     root: LogicalElement,
     connectionDistance: number,
     border: LogicalElement,
-    padding: MindmapPadding = { top: 0, left: 0, bottom: 0, right: 0 },
+    padding: MindmapPadding,
 ): ParsedMindmap {
     const borderIds = new Set(border?.elements.map((element) => element.id));
     const scene = ea.getViewElements().filter((element) => {
@@ -217,7 +235,8 @@ export function parseMindmap(
         return data.isMindmapTemporary !== true && data.isMindmapBorder !== true && !borderIds.has(element.id);
     });
     const space = coordinateSpace(border, padding);
-    const graph = new TreeGraph("Mindmap", root.anchor.id, space.width, space.height);
+    const graph = new TreeEdgeGraph("Mindmap", root.anchor.id, space.width, space.height, MAX_OFFSET_RATIO);
+    const edges = new Map<string, EdgeBinding>();
     const queue: LogicalElement[] = [root];
     const nodes: LogicalElement[] = [root];
     const queued = new Set([root.anchor.id]);
@@ -228,12 +247,14 @@ export function parseMindmap(
     for (let readIndex = 0; readIndex < queue.length; readIndex++) {
         const parent = queue[readIndex];
         for (const line of scene) {
-            const endpoints = linePoints(line);
+            const endpoints = lineEndpoints(line);
             if (!endpoints) continue;
-            const nearStart = distanceToBoundary(endpoints[0], parent) <= connectionDistance;
-            const nearEnd = distanceToBoundary(endpoints[1], parent) <= connectionDistance;
+            const nearStart = distanceToBoundary(endpoints.start, parent) <= connectionDistance;
+            const nearEnd = distanceToBoundary(endpoints.end, parent) <= connectionDistance;
             if (!nearStart && !nearEnd) continue;
-            const endpoint = nearStart ? endpoints[1] : endpoints[0];
+            const parentEnd: LineEnd = nearStart ? "start" : "end";
+            const parentPoint = nearStart ? endpoints.start : endpoints.end;
+            const endpoint = nearStart ? endpoints.end : endpoints.start;
             const candidate = nearestCandidate(endpoint, candidates, connectionDistance);
             if (!candidate || queued.has(candidate.anchor.id)) continue;
             if (isLoop(candidate.anchor.id, parent.anchor.id, parentById)) continue;
@@ -242,10 +263,17 @@ export function parseMindmap(
             queue.push(candidate);
             nodes.push(candidate);
             graph.addNode(nodeFor(candidate, parent.anchor.id, space));
+            const binding = bindLineToEdge(
+                graph,
+                { lineId: line.id, childId: candidate.anchor.id, parentEnd },
+                sceneToGraphPoint(parentPoint, space),
+                sceneToGraphPoint(endpoint, space),
+            );
+            if (binding) edges.set(candidate.anchor.id, binding);
         }
     }
 
     console.log(`Parsed ${nodes.length} nodes from mindmap. Serialized graph:`);
     console.log(graph.serialize());
-    return { graph, nodes, coordinateSpace: space };
+    return { graph, nodes, edges, coordinateSpace: space };
 }

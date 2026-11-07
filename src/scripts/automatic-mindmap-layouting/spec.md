@@ -10,8 +10,8 @@ graph parsing, layout, persistence, and evaluation code must satisfy.
 
 The script automatically lays out an existing Excalidraw mindmap. It must
 discover a tree from existing node and line elements, represent it as a
-`TreeGraph`, run one of the layout algorithms from the linked `core` folder,
-and write the resulting node positions back to the drawing.
+`TreeEdgeGraph`, run one of the layout algorithms from the linked `core` folder,
+and write the resulting node positions and edge lines back to the drawing.
 
 The project is the practical TypeScript implementation of the research project
 **Automatisierte Zeichnung von Mindmaps**. The long-term objective is a
@@ -36,13 +36,18 @@ src/scripts/automatic-mindmap-layouting/
   groups.ts                       Logical element (group/bound text) resolution
   metadata.ts                     Metadata defaults, validation, shape rule
   parser.ts                       Line parser and metadata hydration
+  edges.ts                        Line <-> anchored edge geometry
+  layout.ts                       Writes a graph back to the canvas
   backup.ts                       Vault backups and rollback
   preview.svg                     Script preview asset
   README.md                       Script-facing documentation
   spec.md                         This implementation specification
   core/                            Symbolic link to the research engine
     graph/types.ts                TreeNode, TreeEdge, TreeGraph
+    graph/TreeEdgeGraph.ts        TreeGraph subclass with movable edge anchors
+    graph/shapes.ts               Shape geometry (ray casting, anchor clamping)
     graph/evaluation.ts           Graph metrics and formatted metrics string
+    graph/evaluationEdge.ts       Metrics measured on anchored edges
     graph/generators.ts            Reproducible test graphs
     algorithms/types.ts           LayoutAlgorithm contract
     algorithms/...                 Random, radial, Eades, Fruchterman-Reingold,
@@ -130,7 +135,7 @@ linked by `containerId`, not by `groupIds`:
 
 ### 3.2 Obsidian and Excalidraw plugin runtime model
 
-Findings from the Obsidian 1.14.5 app bundle and the Excalidraw plugin 2.27.3
+Findings from the Obsidian 1.14.5 and 1.15.0 app bundles and the Excalidraw plugin 2.27.3
 bundle (`main.js`). They explain the close, save, and rollback behavior and
 must be rechecked when either is upgraded.
 
@@ -147,7 +152,9 @@ any more; the workbench captures `app`, `file`, `leaf`, the imperative API, and
 
 #### 3.2.2 View close order
 
-Obsidian's `WorkspaceLeaf.open` awaits the old view's `View.close()`, which is
+Obsidian's `WorkspaceLeaf.open` awaits the old view's `View.close()` (it skips
+the await only for two built-in view classes that `ExcalidrawView`, a
+`TextFileView`, is not), which is
 `containerEl.detach(); this.unload(); await this.onClose()`:
 
 1. `Component.unload()` sets `_loaded = false` **first**, unloads children and
@@ -157,6 +164,11 @@ Obsidian's `WorkspaceLeaf.open` awaits the old view's `View.close()`, which is
 2. `ExcalidrawView.onClose()` calls `forceSaveIfRequired()` (the final save),
    unmounts the React root, and only then calls `removeViewEAs(view)`, which
    destroys the script EA and runs its `registerCleanup` callbacks.
+3. **The final save is not written yet when `close()` resolves.** While
+   `semaphores.viewunload` is set, `performSave` captures the file content and
+   schedules `window.setTimeout(() => vault.modify(file, data), 200)`. This
+   happens whenever the view is dirty at close, and removing the indicators
+   makes it dirty.
 
 Consequences:
 
@@ -168,6 +180,8 @@ Consequences:
   **"targetView not set"**. The imperative API captured at startup still works,
   and `api.updateScene` applies synchronously, so a removal there is part of
   the scene that `forceSaveIfRequired` saves next.
+- Anything that writes the file right after closing its view is overwritten
+  about 200 ms later by the old view's content (section 10).
 
 #### 3.2.3 Saving
 
@@ -177,6 +191,11 @@ autosave tick, on `onUnloadFile` (switching files in the same tab), and on
 close. `forceSaveIfRequired` compares the current scene version with the last
 saved one, so removing indicators that were never saved does not trigger an
 extra save.
+
+The plugin's BAK cache (`getImageCache().addBAKToCache`, in IndexedDB) stores the
+last saved file content, but it is read only when loading a drawing fails or
+yields an empty scene, and then only after a prompt. It does not reapply changes
+to a drawing that loads normally, and clearing it would not affect rollback.
 
 #### 3.2.4 Hook server
 
@@ -241,8 +260,8 @@ Metadata is stored on the relevant persistent element using merged
 ```
 
 Padding values are integers in `[-120, 120]`. A new border starts with
-`DEFAULT_PADDING` (top `90`, left `100`, bottom `110`, right `100`); a
-malformed persisted side falls back to `0`. On startup, scan the current scene
+`DEFAULT_PADDING` (top `90`, left `100`, bottom `110`, right `100`), and a
+malformed persisted side falls back to its default. On startup, scan the current scene
 for `isMindmapBorder === true`, load the element and valid padding into runtime
 state, and silently continue without a preview if none exists. If multiple
 elements are marked, the first match in scene order is used. Removing the
@@ -259,8 +278,8 @@ other border flags with a warning (as is done for roots) is not implemented yet.
 }
 ```
 
-`mindmapConnectionDistance` is an integer in `[1, 300]`. The runtime default
-is `15`; a malformed persisted value falls back to `50`.
+`mindmapConnectionDistance` is an integer in `[1, 300]`. The default is `15`,
+also for a malformed persisted value.
 `mindmapShape` is the normalized `TreeNode.shape` value. The UI may label the
 rectangle option `rect`, but graph data must use `rectangle`, matching the core
 types and evaluation functions.
@@ -285,6 +304,30 @@ values: it maps unknown inputs such as `"diamond"` to `ellipse`.)
 The root is also a node and has `mindmapParent` omitted. Parsing may update
 existing mindmap metadata, but must preserve unrelated `customData` keys.
 
+### Edge elements
+
+Each line or arrow that draws a parsed edge carries:
+
+```ts
+{
+  isMindmapEdge: true,
+  mindmapEdge: {
+    parentId: string,           // parent anchor ID
+    childId: string,            // child anchor ID, equal to the core's edge ID
+    parentEnd: "start" | "end", // which line end attaches to the parent
+    parentOffset: { x, y },     // anchor relative to the parent center
+    childOffset: { x, y },      // anchor relative to the child center
+    parentGap: number,          // line end to parent boundary (negative: inside)
+    childGap: number            // line end to child boundary (negative: inside)
+  }
+}
+```
+
+The metadata lives on the line because the line is the element it describes:
+deleting the line removes the binding, and undo restores it. Node elements store
+no line IDs. `readEdgeMetadata` validates the value; malformed metadata counts as
+no binding.
+
 ## 5. Primary Floating Modal
 
 The main modal title is **Automatic Mindmap Layouting**. It is opened as soon
@@ -300,6 +343,13 @@ first maps selected indicators to their owner via
 text into its container. Selecting an indicator is therefore equivalent to
 selecting its node; selecting both the node and its indicator is not
 ambiguous.
+
+**Notices.** Each user action reports its result with an Obsidian notice: root
+saved, border saved, parse result (node and edge counts), shape applied, metadata
+cleared, backup created, backup restored, backups cleared, and every failed
+precondition or error. Restarting the script while a workbench is open, or
+opening another file in its tab, also shows a notice. Continuous input (sliders)
+and automatic refreshes stay silent.
 
 The modal is rendered from runtime state. A scene change re-renders it only
 when border/root/graph presence changed (for example the root was deleted or
@@ -350,7 +400,7 @@ sliders are not rebuilt while the user drags them.
   updates those already marked `isMindmapNode` (the root included), both in
   metadata and in their temporary indicators.
 - Show Graph Statistics after parsing or successful startup graph loading, using
-  `calculateGraphMetricsString(graph)`. Statistics follow moved and deleted
+  `calculateTreeEdgeGraphMetricsString(graph)`. Statistics follow moved and deleted
   content (the graph is re-hydrated after every scene change).
 - Provide a Connection Distance input with slider and number field, constrained
   to `1..300`, defaulting to `15`. Save it in Root metadata and use it during
@@ -360,14 +410,15 @@ sliders are not rebuilt while the user drags them.
 - Provide **Parse Mindmap** to discard the current parsed graph and parse again
   from the configured Root. Parsing needs a Root and a Border (the Border
   defines the graph coordinate space); a missing one is reported with a notice.
-- Provide **Clear Mindmap** to remove all Mindmap Node metadata from the current
-  scene and discard the current parsed graph. This action does not remove the
-  Border or Root flags, but it does remove node flags and parent/children
-  metadata while preserving normalized shape metadata. Ask for confirmation in
-  an Obsidian modal before clearing.
+- Provide **Clear Mindmap** to remove all Mindmap Node and Edge metadata from the
+  current scene and discard the current parsed graph. This action does not remove
+  the Border or Root flags, but it does remove node flags, parent/children
+  metadata, and edge metadata while preserving normalized shape metadata. Ask for
+  confirmation in an Obsidian modal before clearing.
 - Provide **Clear All Metadata** to remove all Mindmap metadata from the current
-  scene, including Border and Root flags. Ask for confirmation in an Obsidian
-  modal before clearing.
+  scene, including Border and Root flags, and reset padding and Connection
+  Distance to their defaults. Ask for confirmation in an Obsidian modal before
+  clearing.
 
 ### 5.2 Algorithm
 
@@ -436,8 +487,13 @@ inserted first; nodes are never removed from the queue. For each queued node:
    store parent/children metadata, and append its ID to the parent's
    `mindmapChildren` array.
 6. Add a `TreeNode` containing ID, center position, normalized shape, width,
-   height, parent ID, and children IDs to the `TreeGraph`.
-7. Add a temporary node indicator and a temporary small arrow toward its
+   height, parent ID, and children IDs to the `TreeEdgeGraph`, which creates the
+   node's parent edge.
+7. Bind the line that produced the node to this edge (section 7.2) and store
+   `mindmapEdge` on it. Lines that were tracked before and no longer draw an edge
+   lose their edge metadata. A second line between the same two nodes is not
+   tracked.
+8. Add a temporary node indicator and a temporary small arrow toward its
    parent.
 
 Continue until the queue pointer reaches its end and no new lines produce
@@ -447,7 +503,7 @@ temporary indicator as a candidate.
 
 ## 7. Graph and Algorithm Integration
 
-Construct `TreeGraph(name, rootId, width, height)` using the padded border as
+Construct `TreeEdgeGraph(name, rootId, width, height, 0.5)` using the padded border as
 the available layout area. Use the root and every parsed node as `TreeNode`
 instances; preserve actual element dimensions because mixed shapes are a core
 research requirement. Positions are `p5.Vector` centers as required by the
@@ -549,12 +605,74 @@ The default algorithm is intentionally a placeholder until the algorithm
 selection policy is reviewed. The implementation must not claim that one
 algorithm is universally best.
 
+### 7.2 TreeEdgeGraph and edge lines
+
+The script uses `TreeEdgeGraph` exclusively. It extends `TreeGraph`, so everything
+in 7.1 still applies, and is accepted by every `LayoutAlgorithm` (only
+`NikogeniaAlgorithmV1` moves anchors; the others leave them where they are). The
+graph holds one `AnchoredTreeEdge` per non-root node, keyed by child ID and
+created by `addNode`. Its `parentOffset` and `childOffset` are relative to the
+node centers. Offsets are always written through `graph.setOffset`, which projects
+them into the anchor region (the node shape scaled by `maxOffsetRatio`, here
+`0.5`). Conceptually an edge runs anchor to anchor below opaque nodes, so its
+visible part starts at the node boundaries.
+
+`ParsedMindmap.edges` (`Map<childId, EdgeBinding>`) links each edge to its line.
+`edges.ts` converts in both directions:
+
+**Line to edge (`bindLineToEdge`, while parsing).** The line is modelled by its
+chord. Each anchor is the point on the chord's extension closest to the node
+center, so a line aiming at the center has offset 0 and an off-center line keeps
+its position. The gap is the signed distance between the drawn line end and the
+node boundary along the anchor-to-anchor direction.
+
+**Edge to line (`edgeEndpoints`, after a layout).** With `u` the unit direction
+from anchor `a` to anchor `b`:
+
+```text
+parent end = a + u * (exitDistance(parent, parentOffset,  u) + parentGap)
+child end  = b - u * (exitDistance(child,  childOffset,  -u) + childGap)
+```
+
+`exitDistance` is the core's ray cast from an inner point to the shape boundary.
+If nothing would remain visible (overlapping nodes), the line spans the anchors.
+These two conversions are inverse: for an unchanged layout and unclamped anchors,
+the line ends exactly where it was drawn.
+
+**Hydration (`hydrateEdges`)** reads offsets and gaps from the line metadata rather
+than the line's current geometry. A node moved by hand therefore keeps a valid
+offset instead of turning the old line position into a large one. A line edited by
+hand takes effect at the next parse. The first line in scene order wins when
+several claim one edge (a copied line). An edge without a line stays centered and
+is not redrawn.
+
+**Writing back (`layout.ts: writeGraphToScene`).** One transaction that:
+
+- moves every node's logical element by `target center - current center`, with
+  the target from `graphToScenePoint`; size, IDs, and metadata are preserved;
+- redraws every tracked line with `edgeEndpoints`, honoring `parentEnd`; bends and
+  curves of multi-point lines keep their form because all points go through the
+  rotation and scaling that maps the old chord onto the new one (`reshapeLine`);
+- shifts a line's label (bound text) by the moved midpoint;
+- stores the current offsets in `mindmapEdge`.
+
+Undo capture defaults to `"NEVER"`, because Rollback is the undo of a layout run.
+Lines grouped with a node are placed by the edge logic, not moved with the group.
+
+The layout runner calls `writeGraphToScene` after each render inside
+`session.run(...)`. It must keep its own `ParsedMindmap` and skip `hydrate` during
+a run, because hydration creates a new graph after every scene change, and that
+includes the runner's own writes.
+
 ## 8. Evaluation and Best Layout
 
 After parsing and after each rendered layout, calculate and display
-`calculateGraphMetricsString(graph)`. This currently reports node count and
+`calculateTreeEdgeGraphMetricsString(graph)`. This reports node count and
 overlaps, edge count and crossings, node-edge overlaps, minimum angular
-resolution, edge-length statistics, and node-distance statistics.
+resolution, anchor offset statistics, edge-length statistics, and node-distance
+statistics. Edge metrics are measured on the anchor-to-anchor segments, and
+crossings of edges sharing a node are not counted, because they are hidden inside
+that node.
 
 The core does not define an aggregate score. Until a weighting study is
 approved, “best” means a Pareto improvement: fewer node overlaps, edge
@@ -648,18 +766,28 @@ and restores it in this order (`backup.ts: rollbackLatestMindmapBackup`):
    nothing.
 2. End the workbench session (indicators removed, hook server released).
 3. Close every leaf that shows the drawing (`closeViewsOfFile`:
-   `leaf.setViewState({ type: "empty" })`, which awaits the view's final save
-   and the destruction of the script EA).
-4. Write the backup content with `Vault.modify`. No editor is open, so the
+   `leaf.setViewState({ type: "empty" })`, which awaits the view's close and the
+   destruction of the script EA).
+4. Wait until the file received no `modify` event for 750 ms (at most 5 s), so
+   the old view's deferred final save (section 3.2.2) has landed.
+5. Write the backup content with `Vault.modify`. No editor is open, so the
    plugin's merge (section 3.2.5) cannot interfere.
-5. Reopen the drawing in the original leaf with `leaf.openFile`. The plugin
-   loads the restored file from disk with full fidelity (elements, deletions,
-   text, embedded files).
-6. Delete the consumed backup and the then-empty `mindmap-backup` folder.
+6. Wait for quiet again and read the file back. If the content differs, repeat
+   from step 5, up to three attempts; then fail.
+7. Reopen the drawing in all closed leaves, activating the original, with
+   `leaf.openFile`. This also happens after a failed write. The plugin loads the
+   restored file from disk with full fidelity (elements, deletions, text,
+   embedded files).
+8. Delete the consumed backup and the then-empty `mindmap-backup` folder.
 
-If any step before 6 fails, the backup is kept and an error is logged and
-shown. Clear Backups matches the current file exactly and leaves backups
+If any step before 8 fails, the backup is kept and an error is logged and
+shown. Rollback takes about 1.5 s because of the two quiet periods. Clear Backups matches the current file exactly and leaves backups
 belonging to other drawings untouched.
+
+Without step 4, the restored drawing is visible for a moment and is then replaced:
+the old view's write lands about 200 ms after the close, on top of the restored
+file, and the reopened view picks it up through its `modify` handler. This looked
+like a cache reapplying changes, but no cache is involved.
 
 The earlier approach (write the file while the view is open, then
 `leaf.openFile` on the same file) could not work: `openFile` for the file
@@ -681,7 +809,7 @@ per-file matching, the rollback order above, and cleanup of the empty
   stop cleanly with the existing notice pattern.
 - One `WorkbenchSession` per view (`session.ts`). Starting the script again on
   the same view ends the previous session (`replaced`) first, so two sessions
-  never compete for the hook server.
+  never compete for the hook server. A notice reports the restart.
 - On start the session calls `ea.registerThisAsViewEA()` and sets
   `ea.onViewUnloadHook`, subscribes to `api.onChange`, `api.onPointerDown`,
   `api.onPointerUp`, and the workspace `file-open` event, and registers its
@@ -719,14 +847,15 @@ per-file matching, the rollback order above, and cleanup of the empty
 2. Implement the primary `FloatingModal` and Border Settings modal with live
    previews, cancellation, cleanup, and metadata persistence.
 3. Implement root selection, shape application, and the breadth-first parser.
-4. Add `TreeGraph` construction and graph metrics display.
+4. Add `TreeEdgeGraph` construction, line tracking, and graph metrics display.
 5. Add algorithm selection adapter, Step/Start/Reset controls, and run metrics.
 6. Add vault backup, rollback confirmation, restore/reload, and cleanup. The
   vault helper and UI rollback/cleanup controls are implemented; the future
   layout runner must call backup creation before its first save-enabled edit.
 7. Add focused tests for pure metadata, geometry, queue/loop handling,
-   indicator sync, and algorithm mapping (the repository has no Vitest setup
-   yet; `syncIndicators` was verified with a throwaway fake-EA smoke script);
+   indicator sync, edge geometry, and algorithm mapping (the repository has no
+   Vitest setup yet; `syncIndicators`, edge binding and write-back, and the
+   rollback order were verified with throwaway fake-EA smoke scripts);
    then run the repository check/build and an Obsidian smoke test covering
    modal lifecycle, closing the drawing with the workbench open, popout/mobile
    behavior, selection through indicators, indicator/content moves, parsing,
@@ -755,6 +884,10 @@ per-file matching, the rollback order above, and cleanup of the empty
   indicator recreates it.
 - Rollback restores every element of the backup, including deleted nodes and
   earlier positions, and the restored file is not overwritten afterwards.
+- Parsing produces a `TreeEdgeGraph`, and each edge's line carries `mindmapEdge`
+  metadata. `writeGraphToScene` with an unchanged layout leaves the drawing in
+  place.
+- User actions report their result with a notice.
 - The UI is implemented through documented EA/Obsidian APIs and does not
   mutate immutable scene elements directly.
 - Backup and rollback controls use the documented vault API and remain disabled
@@ -783,6 +916,9 @@ Module responsibilities:
 - `scene.ts`: `TransactionQueue`, `saveMetadata` (fresh copies), `moveElements`,
   `saveCurrentDrawing`, `removeTemporaryElementsNow` (imperative API, usable
   during view unload).
+- `edges.ts`: pure conversion between lines and anchored edges (section 7.2).
+- `layout.ts`: `writeGraphToScene`; not called by the UI until the layout runner
+  exists.
 - `ui.ts`: the `Workbench` runtime object (state, indicator registry, hydrated
   nodes, border preview, child modals) and all UI actions.
 
@@ -798,11 +934,11 @@ It filters temporary and line elements, excludes the configured Border Element
 and every member of its group, walks a queue with a read pointer, uses
 shape-aware boundary distance checks, resolves the nearest eligible canvas
 element in stable scene order, rejects queued and cyclic candidates, and adds
-`TreeNode` instances parent-first to a `TreeGraph`. Parsed nodes retain their
+`TreeNode` instances parent-first to a `TreeEdgeGraph`. Parsed nodes retain their
 actual bounds and normalized shape. Parsing persists parent and children
-metadata (children arrays are copied, not shared with the graph), infers a
-missing shape, and clears stale mindmap relationships; indicators then follow
-from hydration.
+metadata (children arrays are copied, not shared with the graph) and edge metadata
+on the lines, infers a missing shape, and clears stale mindmap relationships;
+indicators then follow from hydration.
 
 Confirmed Clear Mindmap and Clear All Metadata actions are implemented through
 unsaved metadata transactions and preserve unrelated custom data. The current
@@ -848,8 +984,9 @@ its default value is `null`. The session now registers as hook server and
 removes indicators in the hook through the imperative API captured at startup,
 which is synchronous and still mounted at that point.
 
-Rollback closes all views of the file, writes the backup, and reopens the file
-(section 10). The backup is consumed only after the reopen succeeds. All caught
+Rollback closes all views of the file, waits for the deferred final save, writes
+and verifies the backup content, and reopens the file (section 10). The backup is
+consumed only after the reopen succeeds. All caught
 failures are also written with `console.error` before the user notice is shown.
 Clearing the final backup deletes the empty `mindmap-backup` folder itself
 while preserving folders that still contain any files.
@@ -873,14 +1010,22 @@ while preserving folders that still contain any files.
   group ID and `getMaximumGroups` uses the outermost group. If the whole map is
   grouped, every node resolves to the entire map. Nodes must currently be
   ungrouped or grouped only with their own parts.
-- **Bound connectors**: moving content through its indicator moves elements by
-  offset and then calls `api.refreshAllArrows()`. Unbound lines (as used by the
-  parser's endpoint matching) are not moved; this is the layout runner's
-  concern as well.
-- **Defaults**: `DEFAULT_PADDING` (90/100/110/100) differs from the
-  malformed-value fallback (`0`), and the connection-distance default (`15`)
-  differs from its malformed-value fallback (`50`). Decide on one value per
-  setting.
+- **Lines while editing by hand**: moving content through its indicator moves
+  elements by offset and then calls `api.refreshAllArrows()`. Unbound lines stay
+  where they are until `writeGraphToScene` redraws them. With edge tracking in
+  place, the workbench could redraw a moved node's lines immediately.
+- **Line model**: the graph treats every line as its straight chord, so a strongly
+  bent line is measured less exactly. Rotated elements (`angle`) are ignored, as
+  in the node geometry.
+- **Bound arrows**: `writeGraphToScene` writes arrow points but keeps
+  `startBinding`/`endBinding`. Excalidraw may re-route such an arrow to its binding
+  when the node is next moved by hand. Elbow arrows are not specifically supported.
+- **Copied elements** keep their customData, including `mindmapEdge`. Hydration
+  ignores the extra claim and the next parse clears it.
+- **Core typecheck**: `core/graph/generators.ts` passes `parentId: parentId ??
+  undefined`, which `exactOptionalPropertyTypes` in this repository rejects, so
+  `npm run typecheck` reports one error there. The build is not affected. The fix
+  belongs in the simulation repository.
 - **Duplicate border flags** are not repaired (roots are).
 - **Rollback ends the workbench**, because the view and its script EA are
   destroyed. Re-opening it automatically would need a new EA for the reopened
