@@ -77,7 +77,6 @@ export const ADVANCED_PARAMETERS: Parameter<NikogeniaKey>[] = [
     { key: "untangleAnchors", label: "Untangle Anchors", boolean: true },
     { key: "fitToCanvas", label: "Fit To Canvas (Reset)", boolean: true },
     { key: "massByArea", label: "Mass By Area", boolean: true },
-    { key: "fixRoot", label: "Fix Root", boolean: true },
 ];
 
 /** Parameters of the initial layout run by Reset (`RadialAlgorithmArea`). */

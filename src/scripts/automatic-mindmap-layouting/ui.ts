@@ -9,6 +9,8 @@ import {
 } from "./indicators";
 import {
     DEFAULT_CONNECTION_DISTANCE,
+    DEFAULT_RENDERING_DISTANCE,
+    MAX_RENDERING_DISTANCE,
     DEFAULT_PADDING,
     isFixedFlagged,
     loadRuntimeState,
@@ -18,9 +20,9 @@ import {
     type MindmapRuntimeState,
 } from "./metadata";
 import { normalizeBoundText, resolveAnchor, resolveAnchorId, resolveLogicalSelection, type LogicalElement } from "./groups";
-import { loadMindmapFromMetadata, parseMindmap, resolveFixedElements, type ParsedMindmap } from "./parser";
+import { loadMindmapFromMetadata, mindmapName, parseMindmap, resolveFixedElements, type ParsedMindmap } from "./parser";
 import { edgeMetadata } from "./edges";
-import { writeGraphToScene } from "./layout";
+import { writeGraphToScene, type ReparseCheck, type WriteDistances } from "./layout";
 import { fitTextWidths } from "./textfit";
 import {
     ADVANCED_PARAMETERS,
@@ -70,7 +72,12 @@ import {
     disableControls,
 } from "./dom";
 
-type Notify = (message: string) => void;
+type Notify = (message: string, durationMs?: number) => void;
+
+/** Notices stay longer than Obsidian's short default, so results can be read while working on the canvas. */
+const NOTICE_MS = 8000;
+/** Warnings that ask the user to act stay longer still. */
+const WARNING_NOTICE_MS = 12000;
 type WorkspaceLeaf = WorkbenchSession["view"]["leaf"];
 
 interface ProgressElements {
@@ -99,7 +106,8 @@ interface Workbench {
     /** Mindmap parameters stored on the root (`mindmapAlgorithmSettings`), re-read by `hydrate`. */
     storedSettings?: StoredAlgorithmSettings | undefined;
     presence: string;
-    connectionTimer?: number;
+    /** Pending debounced saves of the root distance settings (`saveRootDistance`). */
+    distanceTimers: Partial<Record<RootDistanceKey, number>>;
     settings: AlgorithmSettings;
     /** Current or last layout run; a stopped, unfinished run can be continued. */
     run?: LayoutRun;
@@ -111,7 +119,7 @@ interface Workbench {
 }
 
 const NODE_KEYS = ["isMindmapNode", "mindmapParent", "mindmapChildren", "isMindmapEdge", "mindmapEdge"];
-const ALL_KEYS = ["isMindmapBorder", "mindmapPadding", "isMindmapRoot", "mindmapShape", "mindmapConnectionDistance", "isMindmapFixed", ALGORITHM_SETTINGS_KEY, ...NODE_KEYS];
+const ALL_KEYS = ["isMindmapBorder", "mindmapPadding", "isMindmapRoot", "mindmapShape", "mindmapConnectionDistance", "mindmapRenderingConnectionDistance", "isMindmapFixed", ALGORITHM_SETTINGS_KEY, ...NODE_KEYS];
 const DEBOUNCE_MS = 120;
 const LABEL_WIDTH = "13em";
 
@@ -225,7 +233,7 @@ function loadMindmap(wb: Workbench): ParsedMindmap | undefined {
     const scene = wb.ea.getViewElements();
     const border = resolveAnchorId(wb.ea, wb.state.borderId, scene);
     const root = resolveAnchorId(wb.ea, wb.state.rootId, scene);
-    return border && root ? loadMindmapFromMetadata(wb.ea, root, border, wb.state.padding) : undefined;
+    return border && root ? loadMindmapFromMetadata(wb.ea, root, border, wb.state.padding, mindmapName(wb.session.file.basename)) : undefined;
 }
 
 /**
@@ -360,7 +368,7 @@ async function parseCurrentMindmap(wb: Workbench): Promise<void> {
             const border = resolveAnchorId(ea, state.borderId, scene);
             if (!root) return wb.notify("Select a Root Element before parsing.");
             if (!border) return wb.notify("Configure a Border before parsing.");
-            const parsed = parseMindmap(ea, root, state.connectionDistance, border, state.padding);
+            const parsed = parseMindmap(ea, root, state.connectionDistance, border, state.padding, mindmapName(wb.session.file.basename));
             await saveMetadata(ea, parsePatches(wb, parsed));
             hydrate(wb);
             await syncIndicators(ea, wb.indicators, indicatorModel(wb));
@@ -392,8 +400,11 @@ async function selectRoot(wb: Workbench): Promise<void> {
                 patch: {
                     isMindmapRoot: true,
                     isMindmapNode: true,
+                    // The core does not keep the root in place by itself; fix it on selection, Unfix Selection releases it.
+                    isMindmapFixed: true,
                     mindmapShape: shape,
                     mindmapConnectionDistance: wb.state.connectionDistance,
+                    mindmapRenderingConnectionDistance: wb.state.renderingDistance,
                     mindmapChildren: [],
                     ...(moved ? { [ALGORITHM_SETTINGS_KEY]: moved } : {}),
                 },
@@ -402,7 +413,7 @@ async function selectRoot(wb: Workbench): Promise<void> {
         wb.state.rootId = selected.anchor.id;
         wb.state.rootShape = shape;
     });
-    wb.notify("Root Element saved.");
+    wb.notify("Root Element saved and fixed.");
     await parseCurrentMindmap(wb);
 }
 
@@ -471,14 +482,48 @@ async function fitSelectedTextWidths(wb: Workbench): Promise<void> {
     }
 }
 
-function saveConnectionDistance(wb: Workbench, value: number): void {
-    wb.state.connectionDistance = value;
-    if (wb.connectionTimer !== undefined) window.clearTimeout(wb.connectionTimer);
-    wb.connectionTimer = window.setTimeout(() => {
+/**
+ * Copies the serialized current graph (the same JSON that Parse Mindmap logs:
+ * nodes, anchored edges, fixed flags, graph name) to the clipboard, for
+ * example to add it to the research repository's examples. Uses the hydrated
+ * graph, or the run's live graph while a run owns the scene.
+ */
+async function exportGraphToClipboard(wb: Workbench, doc: Document): Promise<void> {
+    const graph = displayedGraph(wb);
+    if (!graph) {
+        wb.notify("Parse the mindmap first; there is no graph to export.");
+        return;
+    }
+    const serialized = graph.serialize();
+    try {
+        await (doc.defaultView ?? window).navigator.clipboard.writeText(serialized);
+    } catch (error) {
+        reportError(wb, "Could not copy the graph to the clipboard.", error);
+        return;
+    }
+    wb.notify(`Graph "${graph.name}" copied to the clipboard: ${plural(graph.nodes.size, "node")}, ${(serialized.length / 1024).toFixed(1)} KB.`);
+}
+
+/** Root keys of the Parsing and the Rendering Connection Distance. */
+type RootDistanceKey = "mindmapConnectionDistance" | "mindmapRenderingConnectionDistance";
+
+/** Applies a distance setting at once and stores it on the root after a debounce. */
+function saveRootDistance(wb: Workbench, key: RootDistanceKey, value: number): void {
+    if (key === "mindmapConnectionDistance") wb.state.connectionDistance = value;
+    else wb.state.renderingDistance = value;
+    const pending = wb.distanceTimers[key];
+    if (pending !== undefined) window.clearTimeout(pending);
+    wb.distanceTimers[key] = window.setTimeout(() => {
+        delete wb.distanceTimers[key];
         const rootId = wb.state.rootId;
         if (!rootId) return;
-        void wb.session.run(() => saveMetadata(wb.ea, [{ id: rootId, patch: { mindmapConnectionDistance: value } }]));
+        void wb.session.run(() => saveMetadata(wb.ea, [{ id: rootId, patch: { [key]: value } }]));
     }, DEBOUNCE_MS);
+}
+
+/** Line distances of a write-back: the parse to keep intact and the gap at nodes without outline. */
+function writeDistances(wb: Workbench): WriteDistances {
+    return { parsing: wb.state.connectionDistance, rendering: wb.state.renderingDistance };
 }
 
 async function clearMindmapMetadata(wb: Workbench, clearAll: boolean): Promise<void> {
@@ -493,6 +538,7 @@ async function clearMindmapMetadata(wb: Workbench, clearAll: boolean): Promise<v
             delete wb.state.rootId;
             wb.state.padding = { ...DEFAULT_PADDING };
             wb.state.connectionDistance = DEFAULT_CONNECTION_DISTANCE;
+            wb.state.renderingDistance = DEFAULT_RENDERING_DISTANCE;
         }
     });
     await refresh(wb);
@@ -595,7 +641,7 @@ function runHooks(wb: Workbench, run: LayoutRun): RunHooks {
         render: async () => {
             if (!wb.session.alive) return false;
             const written = await wb.session.run(async () => {
-                await writeGraphToScene(wb.ea, run.mindmap);
+                run.reparse = await writeGraphToScene(wb.ea, run.mindmap, writeDistances(wb));
                 run.writtenVersion = contentVersion(wb.ea.getViewElements());
                 return true;
             });
@@ -637,6 +683,17 @@ async function withBusy(wb: Workbench, action: () => Promise<void>): Promise<voi
     }
 }
 
+/**
+ * Warns when the written layout would not parse back to the same tree even
+ * after the line ends were adjusted (`layout.ts: ensureReparsable`). Adjusted
+ * lines alone are normal and stay silent.
+ */
+function notifyReparse(wb: Workbench, check: ReparseCheck | undefined): void {
+    if (!check || check.failed.length === 0) return;
+    wb.notify(`Warning: Parse Mindmap would not recover ${plural(check.failed.length, "edge")} of this layout`
+        + " (nodes too close for the Parsing Connection Distance). Keep using the stored structure or adjust the lines by hand.", WARNING_NOTICE_MS);
+}
+
 function runSummary(run: LayoutRun): string {
     return `step ${run.algorithm.currentIteration} / ${run.algorithm.iterations}`;
 }
@@ -675,6 +732,7 @@ async function toggleStart(wb: Workbench): Promise<void> {
             if (!wb.session.alive) return;
             wb.runStatus = outcome === "completed" ? "Completed" : `Stopped at ${runSummary(run)}`;
             wb.notify(outcome === "completed" ? "Layout run completed." : `Layout run stopped at ${runSummary(run)}.`);
+            notifyReparse(wb, run.reparse);
         } catch (error) {
             wb.run?.stop();
             wb.runStatus = "Failed";
@@ -697,6 +755,7 @@ async function stepOnce(wb: Workbench): Promise<void> {
             }
             await run.step(runHooks(wb, run));
             wb.runStatus = run.completed ? "Completed" : `Paused at ${runSummary(run)}`;
+            notifyReparse(wb, run.reparse);
         } catch (error) {
             wb.runStatus = "Failed";
             reportError(wb, "The layout step failed.", error);
@@ -719,9 +778,10 @@ async function resetLayout(wb: Workbench): Promise<void> {
             }
             applyInitialLayout(mindmap.graph, wb.settings);
             delete wb.run;
-            await wb.session.run(() => writeGraphToScene(wb.ea, mindmap));
+            const reparse = await wb.session.run(() => writeGraphToScene(wb.ea, mindmap, writeDistances(wb)));
             wb.runStatus = "Initial layout applied";
             wb.notify("Initial layout applied (radial, area weighted).");
+            notifyReparse(wb, reparse);
         } catch (error) {
             wb.runStatus = "Failed";
             reportError(wb, "Could not apply the initial layout.", error);
@@ -946,12 +1006,17 @@ function renderDataSection(wb: Workbench, content: HTMLElement): void {
     const fixedActions = addRow(data, "1fr 1fr");
     addButton(fixedActions, "Fix Selection").addEventListener("click", () => void setSelectionFixed(wb, true));
     addButton(fixedActions, "Unfix Selection").addEventListener("click", () => void setSelectionFixed(wb, false));
+    addSpacer(data, "0.5em");
     addButton(data, "Fit Selected Text Widths").addEventListener("click", () => void fitSelectedTextWidths(wb));
     addSpacer(data, "0.5em");
-    addRangePair(data, "Connection Distance", 1, 300, state.connectionDistance, (value) => saveConnectionDistance(wb, value));
+    addRangePair(data, "Parsing Connection Distance", 1, 300, state.connectionDistance, (value) => saveRootDistance(wb, "mindmapConnectionDistance", value));
+    addRangePair(data, "Rendering Connection Distance", 0, MAX_RENDERING_DISTANCE, state.renderingDistance, (value) => saveRootDistance(wb, "mindmapRenderingConnectionDistance", value));
     const parse = addButton(data, "Parse Mindmap");
     parse.disabled = !root;
     parse.addEventListener("click", () => void parseCurrentMindmap(wb));
+    const exportGraph = addButton(data, "Export And Copy To Clipboard");
+    exportGraph.disabled = !displayedGraph(wb);
+    exportGraph.addEventListener("click", () => void exportGraphToClipboard(wb, data.ownerDocument));
     addSpacer(data, "0.5em");
     wb.statsEl = addText(data, statsHtml(wb));
     addSpacer(data, "0.5em");
@@ -1077,7 +1142,7 @@ function renderMain(wb: Workbench, modal: InstanceType<ExcalidrawAutomate["Float
 function handleTeardown(wb: Workbench, modal: { close: () => void }, reason: TeardownReason): void {
     // Stop first: the run checks the flag before its next step and render.
     wb.run?.stop();
-    if (wb.connectionTimer !== undefined) window.clearTimeout(wb.connectionTimer);
+    for (const timer of Object.values(wb.distanceTimers)) window.clearTimeout(timer);
     for (const child of [...wb.childModals]) child.close();
     wb.childModals.clear();
     if (reason !== "modal-close") modal.close();
@@ -1093,8 +1158,8 @@ function handleTeardown(wb: Workbench, modal: { close: () => void }, reason: Tea
  */
 export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => void } | undefined {
     const NoticeClass = ea.obsidian.Notice;
-    const notify: Notify = (message) => {
-        new NoticeClass(message);
+    const notify: Notify = (message, durationMs = NOTICE_MS) => {
+        new NoticeClass(message, durationMs);
     };
     const modal = new ea.FloatingModal(ea.plugin.app);
     // Session callbacks fire only after the workbench below exists.
@@ -1123,6 +1188,7 @@ export function openMindmapWorkbench(ea: ExcalidrawAutomate): { close: () => voi
         fixedIds: [],
         childModals: new Set(),
         presence: "",
+        distanceTimers: {},
         settings: defaultAlgorithmSettings(),
         busy: false,
         runStatus: "Idle",

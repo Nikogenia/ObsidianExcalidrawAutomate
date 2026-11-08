@@ -1,4 +1,5 @@
 import type { NikogeniaAlgorithmV1 } from "./core/algorithms/nikogenia/NikogeniaAlgorithm1";
+import type { ReparseCheck } from "./layout";
 import type { ParsedMindmap } from "./parser";
 
 /** Computation per slice before control returns to Obsidian. */
@@ -46,6 +47,8 @@ export class LayoutRun {
     readonly mindmap: ParsedMindmap;
     /** Content version of the scene after the run's last write (see `contentVersion`). */
     writtenVersion = "";
+    /** Reparse check of the run's last write (`writeGraphToScene`). */
+    reparse: ReparseCheck | undefined;
     private stopRequested = false;
     private active = false;
 

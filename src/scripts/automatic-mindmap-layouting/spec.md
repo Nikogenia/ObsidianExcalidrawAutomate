@@ -36,9 +36,9 @@ src/scripts/automatic-mindmap-layouting/
   scene.ts                        Transaction queue and scene write helpers
   groups.ts                       Logical element (group/bound text) resolution
   metadata.ts                     Metadata defaults, validation, shape rule
-  parser.ts                       Line parser and metadata hydration
+  parser.ts                       Line parser (pure traversal), graph name, metadata hydration
   edges.ts                        Line <-> anchored edge geometry
-  layout.ts                       Writes a graph back to the canvas
+  layout.ts                       Writes a graph back to the canvas, reparse check
   algorithm.ts                    Algorithm options, parameter table, Start/Reset setup
   runner.ts                       Time-sliced layout run (start, stop, continue, step)
   textfit.ts                      Fit Selected Text Widths helper
@@ -281,7 +281,8 @@ other border flags with a warning (as is done for roots) is not implemented yet.
 {
   isMindmapRoot: true,
   mindmapShape: "ellipse" | "rectangle",
-  mindmapConnectionDistance: number,
+  mindmapConnectionDistance: number,           // Parsing Connection Distance
+  mindmapRenderingConnectionDistance?: number, // Rendering Connection Distance
   mindmapChildren: string[],
   mindmapAlgorithmSettings?: {      // stored mindmap parameters (section 5.2)
     algorithm: "nikogenia1",
@@ -291,8 +292,14 @@ other border flags with a warning (as is done for roots) is not implemented yet.
 }
 ```
 
-`mindmapConnectionDistance` is an integer in `[1, 300]`. The default is `15`,
-also for a malformed persisted value.
+`mindmapConnectionDistance` (shown as **Parsing Connection Distance**; the key
+keeps its old name for existing drawings) is an integer in `[1, 300]`. The
+default is `20`, also for a malformed persisted value. Elsewhere in this spec,
+"Connection Distance" on its own means the Parsing Connection Distance.
+
+`mindmapRenderingConnectionDistance` is an integer in `[0, 50]`. The default is
+`15`, also for a missing or malformed value. It is the gap that written lines
+keep from nodes without a visible outline (section 7.2).
 
 `mindmapAlgorithmSettings` holds the mindmap parameters saved with **Save
 Mindmap Parameters**: the algorithm, Steps Per Render, and every parameter of
@@ -341,8 +348,8 @@ Each line or arrow that draws a parsed edge carries:
     parentEnd: "start" | "end", // which line end attaches to the parent
     parentOffset: { x, y },     // anchor relative to the parent center
     childOffset: { x, y },      // anchor relative to the child center
-    parentGap: number,          // line end to parent boundary (negative: inside)
-    childGap: number            // line end to child boundary (negative: inside)
+    parentGap: number,          // line end to parent outline (negative: inside), 0 after a write
+    childGap: number            // line end to child outline (negative: inside), 0 after a write
   }
 }
 ```
@@ -367,7 +374,7 @@ it. The element may be a parsed tree node (it keeps its parent and children) or
 any other element (it becomes an isolated node without parent edge). Lines,
 arrows, and the border cannot be fixed; a stale flag on them is ignored.
 `isFixedFlagged` reads the flag. Clear Mindmap keeps it, Clear All Metadata
-removes it.
+removes it. Selecting a root writes the flag on the new root (section 5.1).
 
 ## 5. Primary Floating Modal
 
@@ -386,13 +393,17 @@ text into its container. Selecting an indicator is therefore equivalent to
 selecting its node; selecting both the node and its indicator is not
 ambiguous.
 
-**Notices.** Each user action reports its result with an Obsidian notice: root
-saved, border saved, parse result (node and edge counts), shape applied, elements
+**Notices.** Each user action reports its result with an Obsidian notice, shown
+for 8 s (`NOTICE_MS`; the reparse warning 12 s, `WARNING_NOTICE_MS`) so that it
+can be read while working on the canvas: root saved and fixed, graph copied to
+the clipboard, border saved, parse result (node and edge counts), shape applied, elements
 fixed or unfixed, text widths fitted (narrowed / already minimal / skipped),
 metadata cleared, backup created (file name), layout run started, continued,
 stopped (with the step), or completed, initial layout applied, mindmap
 parameters saved or restored, algorithm defaults restored, backup restored
-(file name), backups deleted (count), and every failed precondition or error. Restarting the script while a workbench is open, or
+(file name), backups deleted (count), a warning when a written layout would
+not parse back to the same tree (section 7.2), and every failed precondition
+or error. Restarting the script while a workbench is open, or
 opening another file in its tab, also shows a notice. Continuous input (sliders)
 and automatic refreshes stay silent.
 
@@ -442,6 +453,14 @@ applies immediately).
 - The Root's shape is `shapeOf(anchor)` of the group's largest element, so an
   existing `mindmapShape` (for example one set with Apply Shape) is kept.
   Persist the normalized shape with the Root metadata.
+- Selecting a Root also marks it as fixed (`isMindmapFixed: true`, in the same
+  transaction as the root flags). The core no longer keeps the root in place by
+  itself (the former `fixRoot`/"Fix Root" setting is removed, see section 7), so
+  without the flag Start and Reset would move it. The user can release it with
+  **Unfix Selection**; that choice is kept until a root is selected again
+  (selecting the same root again fixes it again). The fixed flag of a previous
+  root is left untouched: it cannot be told apart from a flag the user set, so
+  an old root stays fixed until it is unfixed by hand.
 - Selecting or saving a Root immediately starts automatic parsing from that
   Root.
 - Show a shape dropdown (`ellipse` / `rect`) and **Apply Shape To Selection**. The
@@ -455,6 +474,8 @@ applies immediately).
   the selected logical elements. The border and lines are rejected with a notice.
   Fixed elements get an orange indicator (section 9) and are loaded into the
   graph (section 7). No root, border, or parse is needed to fix an element.
+- A `0.5em` spacer separates the Fix/Unfix row from **Fit Selected Text
+  Widths**, like the other control groups of Mindmap Data.
 - Provide **Fit Selected Text Widths**: every selected free-standing text element
   (not container-bound text, whose width follows its container) is narrowed to
   the minimum width that keeps its line breaks, in one undoable transaction:
@@ -474,11 +495,27 @@ applies immediately).
 - Show Graph Statistics after parsing or successful startup graph loading, using
   `calculateTreeEdgeGraphMetricsString(graph)`. Statistics follow moved and deleted
   content (the graph is re-hydrated after every scene change).
-- Provide a Connection Distance input with slider and number field, constrained
-  to `1..300`, defaulting to `15`. Save it in Root metadata and use it during
-  line-endpoint matching. Slider and number input changes use the same short
-  debounce as Border Settings and must not rebuild the modal while the control
-  is being dragged.
+- Provide a **Parsing Connection Distance** input (formerly Connection
+  Distance) with slider and number field, constrained to `1..300`, defaulting
+  to `20`. Save it in Root metadata and use it during line-endpoint matching.
+- Below it, provide a **Rendering Connection Distance** input with slider and
+  number field, constrained to `0..50`, defaulting to `15`, saved in Root
+  metadata (`mindmapRenderingConnectionDistance`) in the same way. Write-backs
+  use it as the gap between line ends and nodes without a visible outline
+  (section 7.2). Selecting a root writes both values to the root.
+- Slider and number input changes of both distances use the same short
+  debounce as Border Settings (one timer per setting) and must not rebuild the
+  modal while the control is being dragged.
+- Below Parse Mindmap, provide **Export And Copy To Clipboard**
+  (`exportGraphToClipboard`): copies `graph.serialize()` of the current graph,
+  the same JSON that Parse Mindmap logs to the console (nodes with positions,
+  sizes, shapes, and `fixed` flags, anchored edges with offsets, graph name), to
+  the clipboard through the view window's `navigator.clipboard`, for example to
+  add the map to the research repository's `examples`. It exports the hydrated
+  graph (metadata plus the live scene, section 7), or the run's live graph while
+  a run owns the scene; no parse is needed. Disabled without a graph. A notice
+  reports the graph name, node count, and size; a clipboard failure is reported
+  as an error.
 - Provide **Parse Mindmap** to discard the current parsed graph and parse again
   from the configured Root. Parsing needs a Root and a Border (the Border
   defines the graph coordinate space); a missing one is reported with a notice.
@@ -591,12 +628,32 @@ The Root is
 inserted first; nodes are never removed from the queue. For each queued node:
 
 1. Inspect line/arrow elements whose start or end is within the configured
-  Connection Distance of the node boundary. The configured Border Element and
-  every member of its group are excluded from candidates.
+  Connection Distance of the node boundary **and** has the node as its nearest
+  eligible element (the same nearest search as step 3). The start is checked
+  first; the end that passes is the parent end. The configured Border Element
+  and every member of its group are excluded from candidates.
+  The nearest-owner condition is new. Before, the first queued node with an
+  end within reach claimed the line, even if the end lay directly on another
+  node's boundary. In packed layouts (gaps between nodes below the Connection
+  Distance) this attached a node's child to a neighbour processed earlier, or
+  took the child end of a short edge for the parent end, so the line resolved
+  back to the already queued parent and the edge was lost. If the node itself
+  is no eligible element (an unusual root), the old reach-only rule applies.
 2. For nodes whose effective shape (`shapeOf`) is ellipse, use the ellipse
    boundary geometry rather than only an axis-aligned rectangle. A shape set
    with Apply Shape therefore also changes connection matching.
 3. Resolve the opposite line endpoint to the nearest eligible canvas element.
+   Distances within `TIE_EPSILON` (1e-6 px) count as equal. Ties are broken by
+   the depth inside a rectangle (`insideDepth`: distance to its nearest side),
+   smaller first, then by scene order. Every point inside a rectangle has
+   distance 0, so before this tie-break a line end inside several overlapping
+   boxes went to the first box in scene order. That happened after layouts in
+   which a node's box covers a whole edge (node-edge overlap): both ends of the
+   line lay inside the covering box, and no position along the line could win
+   the tie. Now an end on its node's outline (depth 0) beats any box that only
+   contains it. A single deep end inside one node still has distance 0 and
+   is unaffected. The epsilon absorbs rounding: an end computed on an outline
+   lies up to about 1e-14 px off it.
    Eligible elements (logical anchors that are not lines, arrows, or bound
    text) are resolved once per parse, not once per line.
 4. Ignore the candidate if it is the current node, already queued, or would
@@ -621,7 +678,13 @@ inserted first; nodes are never removed from the queue. For each queued node:
    parent.
 
 Continue until the queue pointer reaches its end and no new lines produce
-nodes. Parsing must be deterministic: stable scene order and distance tie
+nodes. Steps 1 to 4 are the pure function `traverseLines(root, candidates,
+lines, connectionDistance)` on plain geometry (targets with ID, bounds, and
+effective shape; lines as end points). `parseMindmap` collects the inputs from
+the scene (`parseScene`, `nodeCandidates`, `parseLines`), and the layout
+write-back runs the same function on the geometry it is about to write
+(section 7.2). Both must keep using this one function, otherwise the reparse
+check stops predicting the parser. Parsing must be deterministic: stable scene order and distance tie
 breaks are preferred. It must never convert a line into a node or select a
 temporary indicator as a candidate.
 
@@ -632,6 +695,25 @@ the available layout area. Use the root and every parsed node as `TreeNode`
 instances; preserve actual element dimensions because mixed shapes are a core
 research requirement. Positions are `p5.Vector` centers as required by the
 core.
+
+**Graph name** (`parser.ts: mindmapName`, used by parsing and hydration): the
+drawing's file name without `.md` (`TFile.basename`; Excalidraw drawings in
+this vault are plain `.md` files such as `M12.1 Test.md`). If the name starts
+with a short code, the graph is called `Mindmap <code>`. A short code is one or
+more letters (upper or lower case) immediately followed by a digit, then any
+further letters, digits, and dots, up to the first whitespace or the end of the
+name (`SHORT_CODE = /^(\p{L}+\d[\p{L}\p{N}.]*)(?=\s|$)/u`). Examples:
+`M12.1 Test` and `M12.1 Stammfunktion, Produkt- und Kettenregel` →
+`Mindmap M12.1`; `M12 Jahrgangsstufe 12` → `Mindmap M12`; `M12.1b Test` →
+`Mindmap M12.1b`; `m12a` → `Mindmap m12a`; `Ph10.4 Optik` → `Mindmap Ph10.4`;
+`Test2 xyz` → `Mindmap Test2`. No code (the file name is kept): `Mathe Mindmap`
+(no digit after the letters), `12 Test` (no letter first), `MM 12` (whitespace
+before the digit), `M12.1, Test` and `Inf11.2.3_notes` (another character before
+the first whitespace). An empty name falls back to `Mindmap`. The first version
+required a dot (`M12` was no code) and stopped at any non-letter/digit/dot
+character; this was relaxed. The name appears in the console export and the
+clipboard export, matching the research repository's example
+`example-m12_1.json` ("Mindmap M12.1").
 
 When a configured root and border are present, the graph is reconstructed
 from persisted `mindmapChildren` and `mindmapParent` metadata in breadth-first,
@@ -658,6 +740,12 @@ shape (`shapeOf`), and size rules as parsed nodes. Members of the border and
 lines are skipped. `ParsedMindmap.fixedIds` lists them for the indicators;
 without root and border, hydration still resolves them for the indicators.
 Isolated fixed nodes count in the graph statistics (node count, overlaps).
+`parseMindmap` adds them the same way before it logs the serialized graph, so
+the console export contains the `fixed` flags and the isolated fixed nodes
+(previously it skipped them and returned empty `fixedIds`). The core no longer
+fixes the root implicitly (the former "Fix Root" setting is gone); the
+workbench therefore fixes the root when it is selected (section 5.1), and the
+user can unfix it.
 
 ### 7.1 Core interaction contract
 
@@ -723,8 +811,9 @@ does not use it. An adapter must not invent time scaling, the parameter can be o
 The UI's steps-per-render value is only an outer loop around `step(dt)`. It
 must not change the algorithm's iteration count or other algorithm semantics.
 For our algorithms, `iterations` is the completion limit and `currentIteration` is
-incremented once per `step` call; non-root nodes are moved while the root is
-left fixed, and positive `borderPadding` clamps positions to the graph bounds,
+incremented once per `step` call; every node except the fixed ones is moved (the
+root only stays in place if it is fixed, which root selection does by default,
+section 5.1), and positive `borderPadding` clamps positions to the graph bounds,
 in this use case it should be always set to `1` cause padding is already applied to the graph dimensions.
 
 Initialization and reset are not universally interchangeable. The current
@@ -760,20 +849,69 @@ visible part starts at the node boundaries.
 chord. Each anchor is the point on the chord's extension closest to the node
 center, so a line aiming at the center has offset 0 and an off-center line keeps
 its position. The gap is the signed distance between the drawn line end and the
-node boundary along the anchor-to-anchor direction.
+node's visible outline (`outlineExit`, below) along the anchor-to-anchor
+direction. It is stored in `mindmapEdge` for information only; the write-back
+no longer reproduces it.
 
 **Edge to line (`edgeEndpoints`, after a layout).** With `u` the unit direction
 from anchor `a` to anchor `b`:
 
 ```text
-parent end = a + u * (exitDistance(parent, parentOffset,  u) + parentGap)
-child end  = b - u * (exitDistance(child,  childOffset,  -u) + childGap)
+parent end = a + u * (outlineExit(parent, parentOffset,  u) + parentGap)
+child end  = b - u * (outlineExit(child,  childOffset,  -u) + childGap)
 ```
 
-`exitDistance` is the core's ray cast from an inner point to the shape boundary.
+The write-back uses the preferred gaps of `layout.ts: restGaps`, per end:
+
+- **Node with a visible outline: `OUTLINE_GAP` = 1 px** outside the outline. A
+  tiny gap outside reads better than a line tip poking into the node (rounding,
+  stroke width).
+- **Node without a visible outline: the Rendering Connection Distance**
+  (default 15 px) outside the node box, so lines do not run right up to a plain
+  text.
+
+A node has a visible outline (`ParsedMindmap.outlinedIds`, `parser.ts:
+hasVisibleOutline`) if its anchor is an Excalidraw `rectangle` (node shape
+rectangle) or `ellipse` (node shape ellipse) that fills the node's logical
+bounds within 1 px and shows a stroke (non-transparent stroke colour, stroke
+width > 0) or a fill, with opacity > 0. Texts, images, transparent shapes,
+shapes that do not match the node shape (also diamonds), and groups with content
+outside the shape count as without outline; their node box is the bounding box
+(or the ellipse inscribed in it for ellipse nodes).
+
+Positive gaps shrink when they would leave less than half of the free space
+between the two outlines visible (`edges.ts: fitGaps`), so close nodes still get
+a short line instead of none. `outlineExit` (`edges.ts`) is the ray cast from an
+inner point to the outline Excalidraw draws:
+
+- **Ellipse and sharp rectangle:** the core's `exitDistance` (exact for both).
+- **Rounded rectangle:** Excalidraw draws each corner as a quadratic Bézier
+  curve from `(hw − r, hh)` over the control point `(hw, hh)` to `(hw, hh − r)`
+  (path `M r 0 L w−r 0 Q w 0, w r …`), not as a circular arc. In the corner's
+  quadrant the curve is `x = hw − r(1 − s)², y = hh − r s²`. If the box exit
+  lies in a corner region, the ray is intersected with that curve (a quadratic
+  in `s`, `cornerExit`). The radius follows Excalidraw's `getCornerRadius`
+  (`excalidrawCornerRadius`): legacy and proportional roundness `0.25 ×
+  min(w, h)`; adaptive roundness the same up to `min(w, h) = value / 0.25`, then
+  the fixed `roundness.value` (default 32).
+- `ParsedMindmap.cornerRadii` holds the radius per tree node
+  (`parser.ts: cornerRadiusOf`). The radius applies only if the node's anchor is
+  a rounded Excalidraw `rectangle` with node shape `rectangle` and fills the
+  node's logical bounds (within 1 px). A group with content outside its
+  rectangle, a text, or an image has no visible rounded outline; its node box
+  is the bounding box, and the line ends there.
+
 If nothing would remain visible (overlapping nodes), the line spans the anchors.
-These two conversions are inverse: for an unchanged layout and unclamped anchors,
-the line ends exactly where it was drawn.
+
+Previously the write-back reproduced the gaps recorded at parse time, so that an
+unchanged layout left every line where it was drawn. This was dropped because
+the lines then did not cleanly touch the nodes. Hand-drawn lines often stop
+short of a node or reach into it (the M12.1 drawing in the vault has recorded
+gaps from −55 px to +31 px, and 17 of its node rectangles use adaptive
+rounding), and lines also stopped short of rounded corners because the exit was
+computed on the sharp box. Now the first write snaps every tracked line onto
+the outlines, also with an unchanged layout. The anchor offsets still come from
+the drawn line (and from the anchor clamp, see `bindLineToEdge`).
 
 **Hydration (`hydrateEdges`)** reads offsets and gaps from the line metadata rather
 than the line's current geometry. A node moved by hand therefore keeps a valid
@@ -790,7 +928,118 @@ is not redrawn.
   curves of multi-point lines keep their form because all points go through the
   rotation and scaling that maps the old chord onto the new one (`reshapeLine`);
 - shifts a line's label (bound text) by the moved midpoint;
-- stores the current offsets in `mindmapEdge`.
+- stores the current offsets and the gaps of the drawn line (the preferred
+  gaps, or the fallback gaps of the reparse check) in `mindmapEdge`;
+- before writing, makes sure that parsing the result gives back the same tree
+  (reparse check below) and adjusts line ends where it would not.
+
+`writeGraphToScene(ea, mindmap, distances, captureUpdate?)` takes
+`WriteDistances { parsing, rendering }` (the Parsing Connection Distance a
+later parse will use, and the Rendering Connection Distance) and returns a
+`ReparseCheck` (`expected` edge count, `adjusted` child IDs whose ends left the
+preferred gaps, and `failed` child IDs).
+`ParsedMindmap.borderIds` (border element and group members) lets it rebuild the
+parser's view of the scene.
+
+**Reparse check (`layout.ts: ensureReparsable`).** Problem: after a layout,
+Parse Mindmap sometimes found fewer nodes. Some line ends ended up too far from
+their nodes, or nearer to another node, so the connection was no longer
+detected. Causes:
+
+1. The parser measures the **Euclidean** distance from a line end to the node
+   boundary, but the gap was recorded and re-applied **along the anchor
+   direction** (re-applying gaps is gone since lines end on the outlines). A gap recorded on a line that leaves a node at a grazing angle
+   is much longer along the line than perpendicular to the boundary. After the
+   layout turns the edge, the same gap puts the end far beyond the Connection
+   Distance.
+2. For ellipses the parser uses the radial distance along the ray from the
+   center, also inside the ellipse. A negative gap (end inside the node) is
+   therefore "far" from an ellipse when the direction changes.
+3. Layouts pack nodes closer than the Connection Distance. A line end was then
+   within reach of a neighbour that the breadth-first parse processes earlier,
+   which attached the child to the neighbour, or both ends of a short edge were
+   within reach of the parent. The parser change in section 6 (nearest owner)
+   removes most of this; the check removes the rest.
+4. A node whose box covers a whole edge (node-edge overlap) contains both line
+   ends, which then tie at distance 0. The outline tie-break of section 6
+   (step 3) resolves this.
+
+Solution: the write-back runs the parser's own `traverseLines` on the scene as
+it will look after the write: node candidates moved by their shifts, every
+tracked line at its planned position, untracked lines unchanged (or moved with
+the node group they belong to), border and temporary elements excluded as in
+`parseScene`. *Expected* are the bound edges whose whole path to the root
+consists of bound edges between existing nodes (edges without a line cannot be
+parsed anyway). An expected edge counts as recovered only if the traversal
+accepts it with the same parent, child, line, and parent end. The check runs at
+the Connection Distance minus and plus a margin (`min(1, distance / 4)`), so
+floating point noise cannot change the parse result.
+
+Lines are planned with their preferred gaps. While an expected edge is not
+recovered, the ends of the *failing* lines are moved: lines of unrecovered edges
+whose parent the traversal reached, and tracked lines the traversal used for a
+wrong connection. For each end, the gaps tried in order of preference are the
+preferred gap, half the Connection Distance outside (only if the preferred gap
+is larger), `0` (on the outline), a quarter of the Connection Distance outside,
+halfway to the anchor, half the Connection Distance outside, and the anchor
+(`gapLevels`). They are needed where nodes touch or overlap a neighbour (an end
+at the outline then also lies on or inside the neighbour, and moving it out
+into the free space or deeper into its own node makes its owner unique again),
+and where the Rendering Connection Distance is larger than what the parse
+accepts: such an end shrinks to half the Parsing Connection Distance, which
+always parses. Gap pairs are tried by increasing departure from the preferred
+pair (`gapCandidates`). The
+first pair that strictly improves the score (more recovered edges, then fewer
+wrong connections) is kept, and the failing set is recomputed (`improveOnce`),
+at most `4 × lines` rounds. The line stays on the anchor-to-anchor segment and
+only gets shorter or longer. The check uses the end point exactly as the element
+stores it (`x + (end − start)` from `reshapeLine`), not the computed end, so
+rounding cannot make the real parse differ from the check.
+
+Every write starts again from the preferred gaps, so writing the same layout
+again gives the same lines (deterministic). An edge that cannot be recovered is
+logged with `console.warn`; after Start/Stop, Step, and Reset the workbench shows
+a warning notice with the number of such edges. Adjusted lines alone stay silent.
+
+Verified with a throwaway fake-EA smoke script (scene built from the research
+example `example-m12_1.json`: 64 rectangles, 75 % of them with adaptive
+rounding, plus one ellipse; lines with gaps from −4 px to 0.9 × Connection
+Distance, 30 % bent, random directions; parse, then no layout, Reset + Start, or
+Start only with nikogenia v1 until completion, write, parse again; Connection
+Distance 8, 15, 30; 4 seeds each, 36 runs). Line ends were measured against an
+outline sampled independently from Excalidraw's path definition (sides plus
+quadratic corner curves, or the ellipse):
+
+| Write-back | Edges lost on reparse | Line ends more than 0.5 px off the outline |
+| --- | --- | --- |
+| first version (recorded gaps, sharp box, old parser rule) | 236 | 4149 of about 4400 |
+| outline ends + nearest owner + outline tie-break + reparse check | **0** | 2 (fallback gaps) |
+
+All other ends were within 0.0004 px of the drawn outline. The check's
+prediction equalled the real reparse in every run, and a second write of the
+same layout stayed reparsable. The same scenes with sharp rectangles: 0
+structural losses; once (Connection Distance 30) a child was reparsed with the
+right parent but through an untracked line that comes first in scene order (see
+section 16). This was correctly predicted and warned about. A write took
+2–18 ms for this 65-node graph (about 1–2 ms when no line needs a fallback).
+
+Rendering distance and the 1 px outline gap (same smoke script, 25 % of the
+rectangle nodes replaced by plain texts without outline, all other shapes with
+a visible stroke; Rendering Connection Distance 5, 0, 20, 50 by seed; 36 runs):
+0 edges lost on reparse. Ends at outlined nodes lay 0.04–1.0 px outside the
+drawn outline (exactly 1 px along the line, less perpendicular for slanted
+lines), never inside. Ends at text nodes lay up to the Rendering Connection
+Distance from the box, less where `fitGaps` shrank the gap for close nodes or
+where the distance (20 or 50) exceeded the Parsing Connection Distance and the
+check pulled the end in. Writes took up to 41 ms when many lines needed that
+fallback.
+
+Intermediate result, kept for reference (first smoke version with recorded
+gaps and sharp boxes, 24 runs): previous write-back with the previous parser
+lost 187 edges, the reparse check alone 18, the nearest-owner rule alone 119,
+both together 0. With outline ends, the same scenes then lost up to 5 edges per
+run, all caused by boxes covering whole edges (cause 4). The outline tie-break
+fixed this.
 
 Undo capture defaults to `"NEVER"`, because Rollback is the undo of a layout run.
 Lines grouped with a node are placed by the edge logic, not moved with the group.
@@ -1092,9 +1341,9 @@ per-file matching, the rollback order above, and cleanup of the empty
    indicator sync, edge geometry, and algorithm mapping (the repository has no
    Vitest setup yet; `syncIndicators` (including fixed indicators and the
    outset), edge binding and write-back, fixed node hydration, Reset, runs with
-   stop/continue/Finished/session end, text fitting, backup numbering, and
-   rollback to a chosen backup were verified with throwaway fake-EA smoke
-   scripts);
+   stop/continue/Finished/session end, text fitting, backup numbering,
+   rollback to a chosen backup, and reparse after Reset/Start (section 7.2)
+   were verified with throwaway fake-EA smoke scripts);
    then run the repository check/build and an Obsidian smoke test covering
    modal lifecycle, closing the drawing with the workbench open, popout/mobile
    behavior, selection through indicators, indicator/content moves, parsing,
@@ -1131,6 +1380,18 @@ per-file matching, the rollback order above, and cleanup of the empty
   indicators, are loaded into the graph, and never move during Start, Step, or
   Reset. Indicators lie 2 px outside their content.
 - Fit Selected Text Widths narrows free text without changing its line breaks.
+- Selecting a root marks it as fixed; Unfix Selection releases it.
+- The graph is named after the drawing file (`Mindmap M12.1` for a file name
+  starting with `M12.1`).
+- After Start, Step, or Reset, Parse Mindmap gives the same tree again (same
+  parents and lines); otherwise a warning notice is shown.
+- Written lines end 1 px outside the visible outlines of rectangles (also with
+  Excalidraw's rounded corners) and ellipses, and the Rendering Connection
+  Distance away from nodes without a visible outline (plain texts).
+- The workbench shows Parsing Connection Distance (`1..300`, default 20) and
+  Rendering Connection Distance (`0..50`, default 15), both stored on the root.
+- Export And Copy To Clipboard copies the serialized graph.
+- Notices stay visible for 8 s.
 - Start runs nikogenia v1 on the current layout and turns into Stop; Reset applies
   the radial area weighted initial layout; both create a backup first. Obsidian
   stays responsive during a run, and closing the workbench or the drawing stops
@@ -1166,9 +1427,15 @@ Module responsibilities:
 - `scene.ts`: `TransactionQueue`, `saveMetadata` (fresh copies), `moveElements`,
   `saveCurrentDrawing`, `removeTemporaryElementsNow` (imperative API, usable
   during view unload).
-- `edges.ts`: pure conversion between lines and anchored edges (section 7.2).
+- `edges.ts`: pure conversion between lines and anchored edges, and the
+  visible outline geometry (`outlineExit`, Excalidraw corner radius and corner
+  curve) that line ends are placed at, with gap shrinking for close nodes
+  (`fitGaps`, section 7.2).
 - `layout.ts`: `writeGraphToScene`, used by every render of Start, Step, and
-  Reset.
+  Reset, including the preferred line gaps (`restGaps`, `OUTLINE_GAP`) and the
+  reparse check (`ensureReparsable`, section 7.2).
+- `parser.ts`: `parseMindmap`, `loadMindmapFromMetadata`, the pure
+  `traverseLines` shared with the reparse check, and `mindmapName`.
 - `algorithm.ts`: dropdown options, the parameter table (primary, advanced,
   Reset), default settings from fresh core instances, `createLayoutAlgorithm`
   (Start) and `applyInitialLayout` (Reset).
@@ -1291,6 +1558,38 @@ while preserving folders that still contain any files.
   simulation repository.
 - **Runs on the main thread**: see section 7.3 for the reasoning. A very large
   graph can make single steps (or Reset's rotation search) noticeably long.
+- **Outline of grouped or framed content**: a node whose rectangle does not fill
+  its group's bounds (content sticking out), and text and image nodes, use the
+  bounding box as outline and keep the Rendering Connection Distance from it.
+  Since text boxes include line spacing, the visible gap to the glyphs is a bit
+  larger than configured, and a text node with node shape ellipse measures the
+  gap from the ellipse inscribed in its box. Rotated
+  elements (`angle`) and Excalidraw's hand-drawn roughness are ignored; with
+  roughness the stroke wobbles by a pixel or two around the exact outline.
+- **Hand-drawn line style is not kept**: every write moves the tracked line ends
+  to the preferred gaps (section 7.2), also on Reset or a write of an unchanged
+  layout.
+- **Rendering larger than Parsing Connection Distance**: such ends cannot keep
+  the configured gap, because the parse would lose them. The reparse check
+  pulls them in to half the Parsing Connection Distance; this is silent (an
+  adjusted line, no warning).
+- **Reparse guarantee limits** (section 7.2): the check covers the tracked lines
+  only. Line ends are moved along the anchor segment, never sideways, and lines
+  are never reversed. In the rare fallback case an end stops a few pixels
+  outside its node or reaches into it. An edge between overlapping or touching nodes may still
+  be unrecoverable (warning notice). An untracked line that a layout moves next
+  to a node can still add an unexpected node on reparse; it is counted as a
+  wrong connection but not moved. The guarantee holds for the Connection
+  Distance at write time (±1 px margin); parsing later with a smaller distance
+  can lose edges again. Hand edits after the layout are not checked.
+- **Reparse check cost**: two parser traversals per render, plus some per
+  failing line. Measured 2–18 ms per write on the 65-node M12.1 scene, so
+  Steps Per Render = 1 makes runs noticeably slower on large maps.
+- **Parser change for existing drawings**: the nearest-owner rule and the
+  outline tie-break (section 6) can change the result of Parse Mindmap on
+  hand-drawn maps where a line end lies within reach of, or inside, several
+  nodes: the end now goes to the nearest node (then the nearest outline), before
+  to the first one processed or in scene order.
 - **Edits during a run** are overwritten by the next render for moved nodes; the
   controls that change metadata are disabled, but the canvas itself is not
   locked.

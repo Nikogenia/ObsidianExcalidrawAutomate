@@ -15,7 +15,10 @@ export interface MindmapRuntimeState {
     padding: MindmapPadding;
     rootId?: string;
     rootShape: MindmapShape;
+    /** Parsing Connection Distance: maximum line-end-to-node distance a parse accepts. */
     connectionDistance: number;
+    /** Rendering Connection Distance: gap between written line ends and nodes without a visible outline. */
+    renderingDistance: number;
     mindmap?: ParsedMindmap;
 }
 
@@ -37,12 +40,15 @@ export const DEFAULT_PADDING: MindmapPadding = {
     right: 100,
 };
 
-export const DEFAULT_CONNECTION_DISTANCE = 15;
+export const DEFAULT_CONNECTION_DISTANCE = 20;
+export const DEFAULT_RENDERING_DISTANCE = 15;
+export const MAX_RENDERING_DISTANCE = 50;
 
 export const DEFAULT_RUNTIME_STATE: MindmapRuntimeState = {
     padding: DEFAULT_PADDING,
     rootShape: "ellipse",
     connectionDistance: DEFAULT_CONNECTION_DISTANCE,
+    renderingDistance: DEFAULT_RENDERING_DISTANCE,
 };
 
 /**
@@ -148,6 +154,12 @@ export function loadRuntimeState(elements: readonly ExcalidrawElement[]): Mindma
                     1,
                     300,
                     DEFAULT_CONNECTION_DISTANCE,
+                );
+                state.renderingDistance = clampInteger(
+                    getCustomDataValue(customData, "mindmapRenderingConnectionDistance"),
+                    0,
+                    MAX_RENDERING_DISTANCE,
+                    DEFAULT_RENDERING_DISTANCE,
                 );
             }
         }
