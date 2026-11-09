@@ -34,6 +34,7 @@ import {
     applyStoredSettings,
     INITIAL_LAYOUT_PARAMETERS,
     isBooleanParameter,
+    parameterTooltipText,
     readStoredSettings,
     sameStoredSettings,
     toStoredSettings,
@@ -1035,13 +1036,16 @@ function addParameterControl(wb: Workbench, parent: HTMLElement, parameter: Para
         wb.settings.values[parameter.key] = value;
         invalidateRun(wb);
     };
+    const tooltip = parameterTooltipText(parameter);
     if (isBooleanParameter(parameter)) {
-        addCheckbox(parent, parameter.label, Boolean(wb.settings.values[parameter.key]), update);
+        const checkbox = addCheckbox(parent, parameter.label, Boolean(wb.settings.values[parameter.key]), update);
+        if (checkbox.parentElement) checkbox.parentElement.title = tooltip;  // the row label
         return;
     }
     addRangePair(parent, parameter.label, parameter.min, parameter.max, Number(wb.settings.values[parameter.key]), update, {
         step: parameter.step,
         minLabelWidth: LABEL_WIDTH,
+        tooltip,
     });
 }
 

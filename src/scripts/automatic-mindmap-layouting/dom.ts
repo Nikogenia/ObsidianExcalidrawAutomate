@@ -88,6 +88,8 @@ export interface RangeOptions {
     minLabelWidth?: string;
     /** Label of the slider's maximum position; the number field is then empty and shows it as placeholder. */
     maximumLabel?: string;
+    /** Hover text of the whole row (for example the parameter description). */
+    tooltip?: string;
 }
 
 /**
@@ -112,6 +114,7 @@ export function addRangePair(
     row.style.display = "flex";
     row.style.alignItems = "center";
     row.style.gap = "0.5em";
+    if (options.tooltip) row.title = options.tooltip;
     const labelEl = doc.createElement("label");
     labelEl.textContent = label;
     if (options.minLabelWidth) labelEl.style.minWidth = options.minLabelWidth;

@@ -1,5 +1,12 @@
-import { NikogeniaAlgorithmV1 } from "./core/algorithms/nikogenia/NikogeniaAlgorithm1";
-import { RadialAlgorithmArea } from "./core/algorithms/nikogenia/RadialAlgorithmArea";
+import { NIKOGENIA1_PARAMETERS, NikogeniaAlgorithmV1 } from "./core/algorithms/nikogenia/NikogeniaAlgorithm1";
+import { RADIAL_AREA_PARAMETERS, RadialAlgorithmArea } from "./core/algorithms/nikogenia/RadialAlgorithmArea";
+import {
+    parameterTooltip,
+    parseParameterValue,
+    type AlgorithmParameter,
+    type BooleanParameter,
+    type NumberParameter,
+} from "./core/algorithms/parameters";
 import type { TreeEdgeGraph } from "./core/graph/TreeEdgeGraph";
 
 /** Algorithms selectable in the workbench (value -> dropdown label). */
@@ -17,73 +24,45 @@ export const DEFAULT_STEPS_PER_RENDER = 50;
  */
 const BORDER_PADDING = 1;
 
-type NikogeniaKey = keyof NikogeniaAlgorithmV1 & string;
-type RadialKey = "levelGap" | "areaExponent";
+/** Workbench controls: sliders and checkboxes (the Nikogenia and radial area tables have no select parameters). */
+export type Parameter = NumberParameter | BooleanParameter;
 
-interface NumberParameter<K extends string> {
-    key: K;
-    label: string;
-    min: number;
-    max: number;
-    step: number;
+export function isBooleanParameter(parameter: Parameter): parameter is BooleanParameter {
+    return parameter.type === "boolean";
 }
 
-interface BooleanParameter<K extends string> {
-    key: K;
-    label: string;
-    boolean: true;
-}
-
-export type Parameter<K extends string = string> = NumberParameter<K> | BooleanParameter<K>;
-
-export function isBooleanParameter(parameter: Parameter): parameter is BooleanParameter<string> {
-    return "boolean" in parameter;
+function isControl<K extends string>(parameter: AlgorithmParameter<K>): parameter is NumberParameter<K> | BooleanParameter<K> {
+    return parameter.type !== "select";
 }
 
 /** Always visible below the algorithm dropdown. */
-export const PRIMARY_PARAMETERS: Parameter<NikogeniaKey>[] = [
-    { key: "gapConstant", label: "Gap Constant", min: 0.05, max: 2, step: 0.01 },
-    { key: "maxOffsetRatio", label: "Max Anchor Offset Ratio", min: 0, max: 1, step: 0.01 },
-];
+const PRIMARY_KEYS: readonly string[] = ["gapConstant", "maxOffsetRatio"];
+/** Not exposed: `borderPadding` is fixed to 1 px (`keepInitialLayout` is not in the core table, Start/Reset decide it). */
+const HIDDEN_KEYS: readonly string[] = ["borderPadding"];
+/** Parameters that only affect Reset (the structure preserving start of Nikogenia). */
+const RESET_KEYS: readonly string[] = ["initialRotations", "fitToCanvas"];
 
 /**
- * Collapsed by default. Same ranges as the research web UI (`Nikogenia1Sim.ts`).
- * Not exposed: `borderPadding` (fixed to 1 px) and `keepInitialLayout` (decided
- * by the Start/Reset semantics, see `createLayoutAlgorithm`).
+ * Parameter tables, derived from the core tables (`NIKOGENIA1_PARAMETERS`,
+ * `RADIAL_AREA_PARAMETERS`): labels, descriptions (tooltips), ranges, and steps
+ * are defined once in the algorithm files and shared with the research web UI.
  */
-export const ADVANCED_PARAMETERS: Parameter<NikogeniaKey>[] = [
-    { key: "iterations", label: "Iterations", min: 1, max: 5000, step: 1 },
-    { key: "legalizationIterations", label: "Legalization Iterations", min: 0, max: 500, step: 1 },
-    { key: "nodePadding", label: "Node Padding", min: 0, max: 30, step: 1 },
-    { key: "springStrength", label: "Spring Strength", min: 0, max: 5, step: 0.01 },
-    { key: "springRestFactor", label: "Spring Rest Factor", min: 0, max: 3, step: 0.01 },
-    { key: "repulsionStrength", label: "Repulsion Strength", min: 0, max: 5, step: 0.01 },
-    { key: "vertexEdgeStrength", label: "Vertex Edge Strength", min: 0, max: 3, step: 0.01 },
-    { key: "densityStrength", label: "Density Strength", min: 0, max: 3, step: 0.01 },
-    { key: "densityResolution", label: "Density Resolution", min: 4, max: 64, step: 1 },
-    { key: "borderStrength", label: "Border Strength", min: 0, max: 5, step: 0.01 },
-    { key: "anchorStiffness", label: "Anchor Stiffness", min: 0, max: 2, step: 0.01 },
-    { key: "anchorSpringFactor", label: "Anchor Spring Factor", min: 0, max: 2, step: 0.01 },
-    { key: "anchorOrdering", label: "Anchor Ordering", min: 0, max: 10, step: 0.1 },
-    { key: "anchorSpacingFactor", label: "Anchor Spacing Factor", min: 0, max: 1, step: 0.01 },
-    { key: "initialStepFactor", label: "Initial Step Factor", min: 0.01, max: 2, step: 0.01 },
-    { key: "maxStepFactor", label: "Max Step Factor", min: 0.01, max: 3, step: 0.01 },
-    { key: "minStepFactor", label: "Min Step Factor", min: 0, max: 0.5, step: 0.01 },
-    { key: "stepDecay", label: "Step Decay", min: 0.5, max: 0.99, step: 0.01 },
-    { key: "projectionPasses", label: "Projection Passes", min: 0, max: 20, step: 1 },
-    { key: "subtreeForceFactor", label: "Subtree Force Factor", min: 0, max: 1, step: 0.01 },
-    { key: "initialRotations", label: "Initial Rotations (Reset)", min: 1, max: 72, step: 1 },
-    { key: "preserveCrossings", label: "Preserve Crossings", boolean: true },
-    { key: "untangleAnchors", label: "Untangle Anchors", boolean: true },
-    { key: "fitToCanvas", label: "Fit To Canvas (Reset)", boolean: true },
-    { key: "massByArea", label: "Mass By Area", boolean: true },
-];
+export const PRIMARY_PARAMETERS: Parameter[] = NIKOGENIA1_PARAMETERS
+    .filter(isControl)
+    .filter((parameter) => PRIMARY_KEYS.includes(parameter.key));
+
+/** Collapsed by default; sliders first, then the checkboxes. */
+export const ADVANCED_PARAMETERS: Parameter[] = NIKOGENIA1_PARAMETERS
+    .filter(isControl)
+    .filter((parameter) => !PRIMARY_KEYS.includes(parameter.key) && !HIDDEN_KEYS.includes(parameter.key))
+    .map((parameter) => (RESET_KEYS.includes(parameter.key) ? { ...parameter, label: `${parameter.label} (Reset)` } : parameter))
+    .sort((left, right) => Number(isBooleanParameter(left)) - Number(isBooleanParameter(right)));
 
 /** Parameters of the initial layout run by Reset (`RadialAlgorithmArea`). */
-export const INITIAL_LAYOUT_PARAMETERS: Parameter<RadialKey>[] = [
-    { key: "levelGap", label: "Radial Level Gap (Reset)", min: 0, max: 200, step: 1 },
-    { key: "areaExponent", label: "Radial Area Exponent (Reset)", min: 0, max: 2, step: 0.05 },
-];
+export const INITIAL_LAYOUT_PARAMETERS: Parameter[] = RADIAL_AREA_PARAMETERS
+    .filter(isControl)
+    .filter((parameter) => parameter.key === "levelGap" || parameter.key === "areaExponent")
+    .map((parameter) => ({ ...parameter, label: `Radial ${parameter.label} (Reset)` }));
 
 export type ParameterValues = Record<string, number | boolean>;
 
@@ -111,6 +90,14 @@ export function defaultAlgorithmSettings(): AlgorithmSettings {
     };
 }
 
+let coreDefaults: ParameterValues | undefined;
+
+/** Tooltip of a parameter control: the core description plus the core default value. */
+export function parameterTooltipText(parameter: Parameter): string {
+    coreDefaults ??= defaultAlgorithmSettings().values;
+    return parameterTooltip(parameter, coreDefaults[parameter.key]);
+}
+
 /** Root `customData` key of the stored mindmap parameters. */
 export const ALGORITHM_SETTINGS_KEY = "mindmapAlgorithmSettings";
 
@@ -126,12 +113,6 @@ export type StoredAlgorithmSettings = {
 };
 
 const ALL_PARAMETERS: Parameter[] = [...PRIMARY_PARAMETERS, ...ADVANCED_PARAMETERS, ...INITIAL_LAYOUT_PARAMETERS];
-
-function decimalsOf(step: number): number {
-    const text = String(step);
-    const dot = text.indexOf(".");
-    return dot < 0 ? 0 : text.length - dot - 1;
-}
 
 /** The storable part of the settings, with parameters in table order (stable for comparison). */
 export function toStoredSettings(settings: AlgorithmSettings): StoredAlgorithmSettings {
@@ -163,12 +144,10 @@ export function readStoredSettings(raw: unknown): StoredAlgorithmSettings | unde
         : {};
     for (const parameter of ALL_PARAMETERS) {
         const value = stored[parameter.key];
-        if (isBooleanParameter(parameter)) {
-            if (typeof value === "boolean") result.parameters[parameter.key] = value;
-        } else if (typeof value === "number" && Number.isFinite(value)) {
-            const clamped = Math.min(parameter.max, Math.max(parameter.min, value));
-            result.parameters[parameter.key] = Number(clamped.toFixed(decimalsOf(parameter.step)));
-        }
+        if (typeof value !== (isBooleanParameter(parameter) ? "boolean" : "number")) continue;
+        // clamped to the range and rounded to the step of the core table
+        const parsed = parseParameterValue(parameter, value, true);
+        if (typeof parsed === "number" || typeof parsed === "boolean") result.parameters[parameter.key] = parsed;
     }
     return result;
 }

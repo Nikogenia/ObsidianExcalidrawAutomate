@@ -307,8 +307,10 @@ the parameter table (primary, advanced, and Reset parameters). Reset Before
 Start and the open state of Advanced Parameters are workbench state and are not
 stored. `algorithm.ts: readStoredSettings` validates the value: an unknown
 algorithm, missing or malformed values fall back to the defaults, numbers are
-clamped to the parameter ranges and rounded to the step, and unknown keys are
-ignored. Selecting another root moves the stored parameters to it unless the new
+clamped to the parameter ranges and rounded to the step (the core helper
+`parseParameterValue(parameter, value, true)`, ranges from the core tables, see
+5.2), and unknown keys are ignored. A value of the wrong JSON type (for example
+the string `"7"` for a number) counts as malformed. Selecting another root moves the stored parameters to it unless the new
 root already has its own. Clear All Metadata removes them; Clear Mindmap keeps
 them.
 `mindmapShape` is the normalized `TreeNode.shape` value. The UI may label the
@@ -541,12 +543,41 @@ applies immediately).
   slice.
 - Always visible below: **Gap Constant** and **Max Anchor Offset Ratio**.
 - Collapsed **Advanced Parameters** (`<details>`, open state kept across
-  re-renders): every other public parameter of `NikogeniaAlgorithmV1` with the
-  ranges of the research web UI (`Nikogenia1Sim.ts`), the two Reset parameters of
-  `RadialAlgorithmArea` (level gap, area exponent).
-  Defaults are read from fresh core instances, so they follow core changes.
-  Not exposed: `borderPadding` (always `1`, section 7.1) and `keepInitialLayout`
-  (decided by Start/Reset, section 7.3).
+  re-renders): every other parameter of `NikogeniaAlgorithmV1`, then the two
+  Reset parameters of `RadialAlgorithmArea` (level gap, area exponent). Sliders
+  come first and checkboxes last; within each group the order of the core
+  table is kept.
+- **Parameter source.** All parameter controls come from the core parameter tables
+  `NIKOGENIA1_PARAMETERS` (`NikogeniaAlgorithm1.ts`) and `RADIAL_AREA_PARAMETERS`
+  (`RadialAlgorithmArea.ts`). These tables are the single source of truth shared
+  with the research web UI. They hold the label, a short description, and min, max,
+  and step; the format is in `core/algorithms/parameters.ts`, see the research
+  `spec.md`. `algorithm.ts` only decides what is shown where:
+  - `PRIMARY_KEYS`: the always visible parameters.
+  - `HIDDEN_KEYS`: `borderPadding`, always `1` (section 7.1). `keepInitialLayout`
+    is not part of the core table (Start/Reset decide it, section 7.3).
+  - `RESET_KEYS`: `initialRotations` and `fitToCanvas` get the label suffix
+    `(Reset)`. The radial parameters are labelled `Radial … (Reset)`.
+
+  Select parameters would be skipped (Nikogenia has none). Defaults are still read
+  from fresh core instances, so they follow core changes. A new core parameter
+  appears in Advanced Parameters automatically, for example `longRangeStrength`
+  (Long Range Strength) and `lockEscape` (Lock Escape) were added this way.
+  Before, the script kept its own copy of the parameter table with the ranges of
+  `Nikogenia1Sim.ts`.
+- **Tooltips.** Every parameter row (slider row or checkbox label) has a `title`
+  with the core description and the core default
+  (`algorithm.ts: parameterTooltipText`, core `parameterTooltip`). Example: "Weak
+  repulsion c · g² / gap between all node pairs. Pushes crowded clusters outwards
+  into empty canvas areas (0 = off). Default: 0.3." `dom.ts: addRangePair` takes
+  `tooltip` in its options; `addCheckbox` is unchanged (the lint limit of four
+  parameters), and the title is set on the returned checkbox's label.
+- **New core defaults (long-range repulsion 0.3, lock escape 0.9).** Mindmap
+  parameters stored before these parameters existed lack both keys, so
+  `readStoredSettings` fills in the new defaults. Start on such a drawing
+  therefore uses both techniques too. Set them to 0 and save to get the
+  previous behavior. Details and measurements: research `nikogenia1.md` § 6.5
+  and § 8.
 - The initiation mode is not selectable: Reset always uses the radial area
   weighted layout, Start always uses none (the current layout).
 - Below the parameters, always visible:
@@ -1436,8 +1467,9 @@ Module responsibilities:
   reparse check (`ensureReparsable`, section 7.2).
 - `parser.ts`: `parseMindmap`, `loadMindmapFromMetadata`, the pure
   `traverseLines` shared with the reparse check, and `mindmapName`.
-- `algorithm.ts`: dropdown options, the parameter table (primary, advanced,
-  Reset), default settings from fresh core instances, `createLayoutAlgorithm`
+- `algorithm.ts`: dropdown options, the parameter groups (primary, advanced,
+  Reset) derived from the core parameter tables, tooltips, default settings from
+  fresh core instances, validation of stored settings, `createLayoutAlgorithm`
   (Start) and `applyInitialLayout` (Reset).
 - `runner.ts`: `LayoutRun` (time-sliced `run`, `step`, `stop`),
   `contentVersion`, `stepTimings`.
