@@ -583,8 +583,8 @@ applies immediately).
   parameters stored before these parameters existed lack both keys, so
   `readStoredSettings` fills in the new defaults. Start on such a drawing
   therefore uses both techniques too. Set them to 0 and save to get the
-  previous behavior. Details and measurements: research `nikogenia1.md` § 6.5
-  and § 8.
+  previous behavior. Both techniques are explained in the research paper
+  (Nikogenia V1) and the research `simulation/spec.md`.
 - The initiation mode is not selectable: Reset always uses the radial area
   weighted layout, Start always uses none (the current layout).
 - Below the parameters, always visible:
