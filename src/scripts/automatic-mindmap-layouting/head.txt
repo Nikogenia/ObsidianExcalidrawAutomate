@@ -1,0 +1,15 @@
+/*
+Automatic Mindmap Layouting
+---------------------------
+
+Author: Nikogenia
+Source: [https://github.com/Nikogenia/ObsidianExcalidrawAutomate](https://github.com/Nikogenia/ObsidianExcalidrawAutomate)
+Research: [https://github.com/BOGYLI/simulierte-wirklichkeit/tree/nikolas/projects/nikolas](https://github.com/BOGYLI/simulierte-wirklichkeit/tree/nikolas/projects/nikolas)
+Release: 10.11.2026
+
+Note:
+This script is emitted as .md so it remains editable in Obsidian's markdown editor.
+If both .md and .js exist for the same script name, Obsidian Excalidraw prefers .md.
+
+```javascript
+*/

@@ -1,6 +1,18 @@
 # ExcalidrawAutomate script workspace
 
-Create and maintain multiple scripts for the Obsidian Excalidraw Script Engine.
+## Automatic Mindmap Layouting Tool
+1. Copy the folder `./Automatic Mindmap Layouting Tool` into the `[Vault]/Excalidraw/Scripts/` directory.
+2. Open the Obsidian Tool Panel in an Excalidraw Session.
+3. Start the Script from there and you are good to go!
+
+The source is in the directory [src/scripts/automatic-mindmap-layout](./src/scripts/automatic-mindmap-layouting/)
+
+This script is part of the scientific research project [Simulierte Wirklichkeit](https://github.com/BOGYLI/simulierte-wirklichkeit/tree/nikolas/projects/nikolas). Refer to the main repository for the full project description, including the research paper and simulation environment.
+
+
+---
+
+# Excalidraw Automate Guide
 
 ## Start your own repository
 
@@ -75,18 +87,18 @@ plugin → template → personal repository workflow.
 
 ## Commands
 
-| Command | Purpose |
-| --- | --- |
-| `npm run new-script -- --name "My Script"` | Scaffold a script and preview |
-| `npm run check` | Typecheck and lint |
-| `npm run build` | Bundle source scripts into ready-to-run artifacts under `build/` |
-| `npm run package` | Build and copy artifacts into `release/` |
-| `npm run update-template:check` | Preview an upstream template update |
-| `npm run update-template` | Apply a reviewed update |
-| `npm run test:template` | Verify updater behavior and API typing |
-| `npm run repo:export` | Export `repository.zip` for a chat session |
-| `npm run repo:update` | Import returned files from `~/Downloads/update/` |
-| `npm run sync-refs` | Maintainers only: refresh from a sibling plugin checkout |
+| Command                                    | Purpose                                                          |
+| ------------------------------------------ | ---------------------------------------------------------------- |
+| `npm run new-script -- --name "My Script"` | Scaffold a script and preview                                    |
+| `npm run check`                            | Typecheck and lint                                               |
+| `npm run build`                            | Bundle source scripts into ready-to-run artifacts under `build/` |
+| `npm run package`                          | Build and copy artifacts into `release/`                         |
+| `npm run update-template:check`            | Preview an upstream template update                              |
+| `npm run update-template`                  | Apply a reviewed update                                          |
+| `npm run test:template`                    | Verify updater behavior and API typing                           |
+| `npm run repo:export`                      | Export `repository.zip` for a chat session                       |
+| `npm run repo:update`                      | Import returned files from `~/Downloads/update/`                 |
+| `npm run sync-refs`                        | Maintainers only: refresh from a sibling plugin checkout         |
 
 For chat-based edits, upload `repository.zip`, request only changed files with
 repository-relative paths, extract them into `~/Downloads/update/`, then run
