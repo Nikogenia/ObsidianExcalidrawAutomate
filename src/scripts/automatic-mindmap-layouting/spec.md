@@ -543,8 +543,15 @@ applies immediately).
   slice.
 - Always visible below: **Gap Constant** and **Max Anchor Offset Ratio**.
 - Collapsed **Advanced Parameters** (`<details>`, open state kept across
-  re-renders): every other parameter of `NikogeniaAlgorithmV1`, then the two
-  Reset parameters of `RadialAlgorithmArea` (level gap, area exponent). Sliders
+  re-renders): every other parameter of `NikogeniaAlgorithmV1`, then the three
+  Reset parameters of `RadialAlgorithmArea` (level gap, area exponent, and
+  **Radial Randomize Order (Reset)**, `randomizeOrder`, default on). With
+  random order every Reset tries a different arrangement of the branches, instead
+  of the same start layout up to rotation. On average it is worse than the
+  mindmap order, but a few Resets can find a better start (measurements in the
+  research `spec.md`, RadialAlgorithmArea). Rollback undoes an unwanted Reset.
+  The default comes from the core class, so stored mindmap parameters without
+  the key now get random order; drawings saved with the toggle off keep it off. Sliders
   come first and checkboxes last; within each group the order of the core
   table is kept.
 - **Parameter source.** All parameter controls come from the core parameter tables

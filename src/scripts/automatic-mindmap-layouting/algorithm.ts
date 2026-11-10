@@ -59,9 +59,10 @@ export const ADVANCED_PARAMETERS: Parameter[] = NIKOGENIA1_PARAMETERS
     .sort((left, right) => Number(isBooleanParameter(left)) - Number(isBooleanParameter(right)));
 
 /** Parameters of the initial layout run by Reset (`RadialAlgorithmArea`). */
+const INITIAL_LAYOUT_KEYS: readonly string[] = ["levelGap", "areaExponent", "randomizeOrder"];
 export const INITIAL_LAYOUT_PARAMETERS: Parameter[] = RADIAL_AREA_PARAMETERS
     .filter(isControl)
-    .filter((parameter) => parameter.key === "levelGap" || parameter.key === "areaExponent")
+    .filter((parameter) => INITIAL_LAYOUT_KEYS.includes(parameter.key))
     .map((parameter) => ({ ...parameter, label: `Radial ${parameter.label} (Reset)` }));
 
 export type ParameterValues = Record<string, number | boolean>;
@@ -207,6 +208,7 @@ export function applyInitialLayout(graph: TreeEdgeGraph, settings: AlgorithmSett
     const radial = new RadialAlgorithmArea();
     radial.levelGap = Number(settings.values.levelGap);
     radial.areaExponent = Number(settings.values.areaExponent);
+    radial.randomizeOrder = Boolean(settings.values.randomizeOrder);
     radial.initialize(graph);
     configureNikogenia(settings, false).initialize(graph);
 }
